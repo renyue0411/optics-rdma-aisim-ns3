@@ -37,6 +37,7 @@ build_lib(
     model/switch-node.cc
     model/switch-mmu.cc
     model/nvswitch-node.cc
+    model/ocs-node.cc
     model/point-to-point-remote-channel.cc
   HEADER_FILES
     ${mpi_headers}
@@ -60,6 +61,7 @@ build_lib(
     model/switch-mmu.h
     model/trace-format.h
     model/nvswitch-node.h
+    model/ocs-node.h
     model/point-to-point-remote-channel.h
   LIBRARIES_TO_LINK ${libnetwork}
                     ${mpi_libraries}
