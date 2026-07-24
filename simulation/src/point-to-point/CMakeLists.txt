@@ -38,6 +38,9 @@ build_lib(
     model/switch-mmu.cc
     model/nvswitch-node.cc
     model/ocs-node.cc
+    model/ocs-data-plane-controller.cc
+    model/rdma-ocs-controller.cc
+    model/rdma-userspace-transport.cc
     model/point-to-point-remote-channel.cc
   HEADER_FILES
     ${mpi_headers}
@@ -62,6 +65,9 @@ build_lib(
     model/trace-format.h
     model/nvswitch-node.h
     model/ocs-node.h
+    model/ocs-data-plane-controller.h
+    model/rdma-ocs-controller.h
+    model/rdma-userspace-transport.h
     model/point-to-point-remote-channel.h
   LIBRARIES_TO_LINK ${libnetwork}
                     ${mpi_libraries}

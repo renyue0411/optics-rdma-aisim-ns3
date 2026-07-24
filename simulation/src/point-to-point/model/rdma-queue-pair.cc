@@ -28,6 +28,7 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	dport = _dport;
 	m_size = 0;
 	m_init_size = 0;
+	m_postedLimit = 0;
 	m_src = -1;
 	m_dest = -1;
 	m_tag = -1;
@@ -74,6 +75,7 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 
 void RdmaQueuePair::SetSize(uint64_t size){
 	m_size = size;
+	m_postedLimit = size;
 }
 
 void RdmaQueuePair::SetSrc(uint32_t src){
@@ -108,6 +110,37 @@ uint64_t RdmaQueuePair::GetInitialSize(){
 	return m_init_size;
 }
 
+
+void RdmaQueuePair::SetPostedLimit(uint64_t limit){
+	NS_ASSERT_MSG(limit <= m_size, "posted limit exceeds qp size");
+	m_postedLimit = limit;
+	if (snd_nxt > m_postedLimit){
+		snd_nxt = m_postedLimit;
+	}
+	if (snd_una > m_postedLimit){
+		snd_una = m_postedLimit;
+	}
+}
+
+void RdmaQueuePair::AddPostedBytes(uint64_t bytes){
+	NS_ASSERT_MSG(m_postedLimit <= m_size, "posted limit exceeds qp size");
+	uint64_t remaining = m_size - m_postedLimit;
+	uint64_t admitted = bytes < remaining ? bytes : remaining;
+	m_postedLimit += admitted;
+}
+
+uint64_t RdmaQueuePair::GetPostedLimit() const{
+	return m_postedLimit;
+}
+
+uint64_t RdmaQueuePair::GetUnpostedBytes() const{
+	return m_size > m_postedLimit ? m_size - m_postedLimit : 0;
+}
+
+uint64_t RdmaQueuePair::GetPostedOutstandingBytes() const{
+	return m_postedLimit > snd_una ? m_postedLimit - snd_una : 0;
+}
+
 void RdmaQueuePair::SetWin(uint32_t win){
 	m_win = win;
 	// std::cout << "set win: " << m_win << std::endl;
@@ -131,7 +164,7 @@ void RdmaQueuePair::SetAppSentCallback(Callback<void> notifyAppSent){
 
 
 uint64_t RdmaQueuePair::GetBytesLeft(){
-	return m_size >= snd_nxt ? m_size - snd_nxt : 0;
+	return m_postedLimit >= snd_nxt ? m_postedLimit - snd_nxt : 0;
 }
 
 uint32_t RdmaQueuePair::GetHash(void){

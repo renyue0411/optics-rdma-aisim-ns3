@@ -74,6 +74,7 @@ namespace ns3 {
 		m_ackQ = CreateObject<SimpleDropTailQueue>();
 		//m_ackQ = CreateObject<RedQueue>();
 		m_ackQ->SetAttribute("MaxBytes", UintegerValue(0xffffffff)); // queue limit is on a higher level, not here
+		m_nextGateWake = Simulator::GetMaximumSimulationTime();
 	}
 
 	Ptr<Packet> RdmaEgressQueue::DequeueQindex(int qIndex){
@@ -93,6 +94,7 @@ namespace ns3 {
 		return 0;
 	}
 	int RdmaEgressQueue::GetNextQindex(bool paused[]){
+		m_nextGateWake = Simulator::GetMaximumSimulationTime();
 		bool found = false;
 		uint32_t qIndex;
 		if (!paused[ack_q_idx] && m_ackQ->GetNPackets() > 0)
@@ -116,6 +118,16 @@ namespace ns3 {
 			if (!paused[qp->m_pg] && qp->GetBytesLeft() > 0 && !qp->IsWinBound()){
 				if (m_qpGrp->Get(idx)->m_nextAvail.GetTimeStep() > Simulator::Now().GetTimeStep()) //not available now
 					continue;
+
+				if (!m_rdmaGateAllowQp.IsNull() && !m_rdmaGateAllowQp(qp)){
+					if (!m_rdmaGateNextTime.IsNull()){
+						Time t = m_rdmaGateNextTime(qp);
+						if (t > Simulator::Now() && t < m_nextGateWake){
+							m_nextGateWake = t;
+						}
+					}
+					continue;
+				}
 				res = idx;
 				break;
 			}else if (qp->IsFinished()){
@@ -136,6 +148,11 @@ namespace ns3 {
 			qps.resize(nxt);
 		}
 		return res;
+	}
+
+	
+	Time RdmaEgressQueue::GetNextGateWake(void) const{
+		return m_nextGateWake;
 	}
 
 	int RdmaEgressQueue::GetLastQueue(){
@@ -319,14 +336,25 @@ namespace ns3 {
 				// update for the next avail time
 				m_rdmaPktSent(lastQp, p, m_tInterframeGap);
 			}else { // no packet to send
-				NS_LOG_INFO("PAUSE prohibits send at node " << m_node->GetId());
+				NS_LOG_INFO("PAUSE/gate prohibits send at node " << m_node->GetId());
 				Time t = Simulator::GetMaximumSimulationTime();
+				Time now = Simulator::Now();
 				for (uint32_t i = 0; i < m_rdmaEQ->GetFlowCount(); i++){
 					Ptr<RdmaQueuePair> qp = m_rdmaEQ->GetQp(i);
-					t = Min(qp->m_nextAvail, t);
+					if (qp->m_nextAvail > now){
+						t = Min(qp->m_nextAvail, t);
+					}
 				}
-				if (m_nextSend.IsExpired() && t < Simulator::GetMaximumSimulationTime() && t > Simulator::Now()){
-					m_nextSend = Simulator::Schedule(t - Simulator::Now(), &QbbNetDevice::DequeueAndTransmit, this);
+				Time gateWake = m_rdmaEQ->GetNextGateWake();
+				if (gateWake > now){
+					t = Min(gateWake, t);
+				}
+				if (t < Simulator::GetMaximumSimulationTime() && t > now &&
+					(m_nextSend.IsExpired() || t < Time(m_nextSend.GetTs()))){
+					if (!m_nextSend.IsExpired()){
+						Simulator::Cancel(m_nextSend);
+					}
+					m_nextSend = Simulator::Schedule(t - now, &QbbNetDevice::DequeueAndTransmit, this);
 				}
 			}
 			return;
@@ -356,13 +384,20 @@ namespace ns3 {
 				NS_LOG_INFO("PAUSE prohibits send at node " << m_node->GetId());
 				if (m_node->GetNodeType() == 0 && m_qcnEnabled){ //nothing to send, possibly due to qcn flow control, if so reschedule sending
 					Time t = Simulator::GetMaximumSimulationTime();
-					for (uint32_t i = 0; i < m_rdmaEQ->GetFlowCount(); i++){
-						Ptr<RdmaQueuePair> qp = m_rdmaEQ->GetQp(i);
-						t = Min(qp->m_nextAvail, t);
-					}
-					if (m_nextSend.IsExpired() && t < Simulator::GetMaximumSimulationTime() && t > Simulator::Now()){
-						m_nextSend = Simulator::Schedule(t - Simulator::Now(), &QbbNetDevice::DequeueAndTransmit, this);
-					}
+			Time now = Simulator::Now();
+			for (uint32_t i = 0; i < m_rdmaEQ->GetFlowCount(); i++){
+				Ptr<RdmaQueuePair> qp = m_rdmaEQ->GetQp(i);
+				if (qp->m_nextAvail > now){
+					t = Min(qp->m_nextAvail, t);
+				}
+			}
+			Time gateWake = m_rdmaEQ->GetNextGateWake();
+			if (gateWake > now){
+				t = Min(gateWake, t);
+			}
+			if (m_nextSend.IsExpired() && t < Simulator::GetMaximumSimulationTime() && t > now){
+				m_nextSend = Simulator::Schedule(t - now, &QbbNetDevice::DequeueAndTransmit, this);
+			}
 				}
 			}
 		}
@@ -399,12 +434,19 @@ namespace ns3 {
 		}else { // no packet to send
 			NS_LOG_INFO("PAUSE prohibits send at node " << m_node->GetId());
 			Time t = Simulator::GetMaximumSimulationTime();
+			Time now = Simulator::Now();
 			for (uint32_t i = 0; i < m_rdmaEQ->GetFlowCount(); i++){
 				Ptr<RdmaQueuePair> qp = m_rdmaEQ->GetQp(i);
-				t = Min(qp->m_nextAvail, t);
+				if (qp->m_nextAvail > now){
+					t = Min(qp->m_nextAvail, t);
+				}
 			}
-			if (m_nextSend.IsExpired() && t < Simulator::GetMaximumSimulationTime() && t > Simulator::Now()){
-				m_nextSend = Simulator::Schedule(t - Simulator::Now(), &QbbNetDevice::SwitchAsHostSend, this);
+			Time gateWake = m_rdmaEQ->GetNextGateWake();
+			if (gateWake > now){
+				t = Min(gateWake, t);
+			}
+			if (m_nextSend.IsExpired() && t < Simulator::GetMaximumSimulationTime() && t > now){
+				m_nextSend = Simulator::Schedule(t - now, &QbbNetDevice::SwitchAsHostSend, this);
 			}
 		}
 		return;
@@ -751,9 +793,12 @@ namespace ns3 {
 	}
 
 	void QbbNetDevice::UpdateNextAvail(Time t){
-		if (!m_nextSend.IsExpired() && t < Time(m_nextSend.GetTs())){
-			Simulator::Cancel(m_nextSend);
-			Time delta = t < Simulator::Now() ? Time(0) : t - Simulator::Now();
+		Time now = Simulator::Now();
+		if (m_nextSend.IsExpired() || t < Time(m_nextSend.GetTs())){
+			if (!m_nextSend.IsExpired()){
+				Simulator::Cancel(m_nextSend);
+			}
+			Time delta = t < now ? Time(0) : t - now;
 			m_nextSend = Simulator::Schedule(delta, &QbbNetDevice::DequeueAndTransmit, this);
 		}
 	}

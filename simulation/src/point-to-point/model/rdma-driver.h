@@ -8,6 +8,7 @@
 #include <ns3/rdma-hw.h>
 #include <vector>
 #include <unordered_map>
+#include <ns3/rdma-userspace-transport.h>
 
 namespace ns3 {
 
@@ -43,6 +44,20 @@ public:
 	// callback when qp completes
 	void QpComplete(Ptr<RdmaQueuePair> q);
     void SendComplete(Ptr<RdmaQueuePair> q);
+
+	enum InjectionMode{
+		INJECTION_DEFAULT = 0,
+		INJECTION_RNIC = 1,
+		INJECTION_USERSPACE = 2
+	};
+
+	uint32_t m_injectionMode;
+	Ptr<RdmaUserspaceTransport> m_userspaceTransport;
+
+	void SetInjectionMode(uint32_t mode);
+	void ConfigureUserspaceTransport(uint64_t wrChunkBytes, uint64_t maxOutstandingBytes);
+	Ptr<RdmaUserspaceTransport> GetUserspaceTransport() const;
+
 };
 
 } // namespace ns3

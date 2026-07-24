@@ -18,6 +18,7 @@ public:
 	Ipv4Address sip, dip;
 	uint16_t sport, dport;
 	uint64_t m_size, m_init_size, m_tag;
+	uint64_t m_postedLimit; // userspace-visible posted byte limit
 	uint32_t m_src, m_dest;
 	uint64_t snd_nxt, snd_una; // next seq to send, the highest unacked seq
 	uint16_t m_pg;
@@ -88,6 +89,11 @@ public:
 	static TypeId GetTypeId (void);
 	RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, uint16_t _sport, uint16_t _dport);
 	void SetSize(uint64_t size);
+	void SetPostedLimit(uint64_t limit);
+	void AddPostedBytes(uint64_t bytes);
+	uint64_t GetPostedLimit() const;
+	uint64_t GetUnpostedBytes() const;
+	uint64_t GetPostedOutstandingBytes() const;
 	void SetWin(uint32_t win);
 	void SetBaseRtt(uint64_t baseRtt);
 	void SetVarWin(bool v);

@@ -198,6 +198,10 @@ TypeId RdmaHw::GetTypeId (void)
 }
 
 RdmaHw::RdmaHw(){
+	m_rnicGateEnabled = false;
+	m_rnicGateRnicId = 0;
+	m_rnicGateEpochStartNs = 0;
+	m_rnicGatePeriodNs = 0;
 }
 
 void RdmaHw::enable_nvls() {
@@ -234,11 +238,110 @@ void RdmaHw::Setup(QpCompleteCallback cb,SendCompleteCallback send_cb){
 		dev->m_rdmaUpdateTxBytes = MakeCallback(&RdmaHw::UpdateTxBytes, this);
 		// config NIC
 		dev->m_rdmaEQ->m_rdmaGetNxtPkt = MakeCallback(&RdmaHw::GetNxtPacket, this);
+		dev->m_rdmaEQ->m_rdmaGateAllowQp = MakeCallback(&RdmaHw::RnicGateAllowsQp, this);
+		dev->m_rdmaEQ->m_rdmaGateNextTime = MakeCallback(&RdmaHw::GetNextRnicGateTime, this);
 	}
 	// setup qp complete callback
 	m_qpCompleteCallback = cb;
     m_sendCompleteCallback = send_cb;
 }
+
+void RdmaHw::SetQpProgressCallback(QpProgressCallback cb){
+	m_qpProgressCallback = cb;
+}
+
+void RdmaHw::SetQpRecoverCallback(QpRecoverCallback cb){
+	m_qpRecoverCallback = cb;
+}
+
+void RdmaHw::EnableRnicGate(uint32_t rnicId, uint64_t epochStartNs, uint64_t periodNs, const std::vector<RnicGateSlotEntry> &slots){
+	m_rnicGateEnabled = true;
+	m_rnicGateRnicId = rnicId;
+	m_rnicGateEpochStartNs = epochStartNs;
+	m_rnicGatePeriodNs = periodNs;
+	m_rnicGateSlots = slots;
+
+	std::cout << "[RNIC GATE INSTALLED] rnic=" << rnicId
+			  << " epochNs=" << epochStartNs
+			  << " periodNs=" << periodNs
+			  << " slots=" << slots.size()
+			  << std::endl;
+}
+
+void RdmaHw::DisableRnicGate(){
+	m_rnicGateEnabled = false;
+	m_rnicGateSlots.clear();
+}
+
+bool RdmaHw::RnicGateAllowsQp(Ptr<RdmaQueuePair> qp) const{
+	if (!m_rnicGateEnabled || m_rnicGatePeriodNs == 0 || qp == 0){
+		return true;
+	}
+
+	uint32_t dstNodeId = (qp->dip.Get() >> 8) & 0xffff;
+	uint64_t nowNs = static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
+	uint64_t offsetNs = nowNs >= m_rnicGateEpochStartNs ?
+		(nowNs - m_rnicGateEpochStartNs) % m_rnicGatePeriodNs :
+		(m_rnicGatePeriodNs - ((m_rnicGateEpochStartNs - nowNs) % m_rnicGatePeriodNs)) % m_rnicGatePeriodNs;
+
+	for (uint32_t i = 0; i < m_rnicGateSlots.size(); ++i){
+		const RnicGateSlotEntry &slot = m_rnicGateSlots[i];
+		if (offsetNs < slot.startOffsetNs || offsetNs >= slot.endOffsetNs){
+			continue;
+		}
+
+		uint32_t wordIndex = dstNodeId / 64;
+		uint32_t bitIndex = dstNodeId % 64;
+		if (wordIndex >= slot.dstRnicBitmapWords.size()){
+			return false;
+		}
+		return (slot.dstRnicBitmapWords[wordIndex] & (1ULL << bitIndex)) != 0;
+	}
+
+	return false;
+}
+
+Time RdmaHw::GetNextRnicGateTime(Ptr<RdmaQueuePair> qp) const{
+	if (!m_rnicGateEnabled || m_rnicGatePeriodNs == 0 || qp == 0){
+		return Simulator::Now();
+	}
+
+	uint32_t dstNodeId = (qp->dip.Get() >> 8) & 0xffff;
+	uint64_t nowNs = static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
+	uint64_t offsetNs = nowNs >= m_rnicGateEpochStartNs ?
+		(nowNs - m_rnicGateEpochStartNs) % m_rnicGatePeriodNs :
+		(m_rnicGatePeriodNs - ((m_rnicGateEpochStartNs - nowNs) % m_rnicGatePeriodNs)) % m_rnicGatePeriodNs;
+
+	uint64_t bestDeltaNs = UINT64_MAX;
+	for (uint32_t i = 0; i < m_rnicGateSlots.size(); ++i){
+		const RnicGateSlotEntry &slot = m_rnicGateSlots[i];
+		uint32_t wordIndex = dstNodeId / 64;
+		uint32_t bitIndex = dstNodeId % 64;
+		if (wordIndex >= slot.dstRnicBitmapWords.size() ||
+			(slot.dstRnicBitmapWords[wordIndex] & (1ULL << bitIndex)) == 0){
+			continue;
+		}
+
+		uint64_t candidateDeltaNs;
+		if (offsetNs < slot.startOffsetNs){
+			candidateDeltaNs = slot.startOffsetNs - offsetNs;
+		}else if (offsetNs >= slot.startOffsetNs && offsetNs < slot.endOffsetNs){
+			candidateDeltaNs = 0;
+		}else{
+			candidateDeltaNs = m_rnicGatePeriodNs - offsetNs + slot.startOffsetNs;
+		}
+
+		if (candidateDeltaNs < bestDeltaNs){
+			bestDeltaNs = candidateDeltaNs;
+		}
+	}
+
+	if (bestDeltaNs == UINT64_MAX){
+		return Simulator::GetMaximumSimulationTime();
+	}
+	return Simulator::Now() + NanoSeconds(bestDeltaNs);
+}
+
 uint32_t ip_to_node_id(Ipv4Address ip) { return (ip.Get() >> 8) & 0xffff; }
 uint32_t RdmaHw::GetNicIdxOfQp(Ptr<RdmaQueuePair> qp){
 	uint32_t src = qp->m_src;
@@ -269,24 +372,24 @@ Ptr<RdmaQueuePair> RdmaHw::GetQp(uint32_t dip, uint16_t sport, uint16_t pg){
 		return it->second;
 	return NULL;
 }
-void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Address dip, uint16_t sport, uint16_t dport, uint32_t win, uint64_t baseRtt, Callback<void> notifyAppFinish, Callback<void> notifyAppSent){
-	// create qp
+
+Ptr<RdmaQueuePair> RdmaHw::CreateQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Address dip, uint16_t sport, uint16_t dport, uint32_t win, uint64_t baseRtt, Callback<void> notifyAppFinish, Callback<void> notifyAppSent, uint64_t initialPostedBytes){
+	NS_ASSERT_MSG(initialPostedBytes <= size, "initial posted bytes exceed flow size");
+
 	Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(pg, sip, dip, sport, dport);
 	qp->SetSrc(src);
 	qp->SetDest(dest);
 	qp->SetTag(tag);
 	qp->SetSize(size);
 	qp->SetInitialSize(size);
+	qp->SetPostedLimit(initialPostedBytes);
 	qp->SetWin(win);
 	qp->SetBaseRtt(baseRtt);
 	qp->SetVarWin(m_var_win);
 	qp->SetAppNotifyCallback(notifyAppFinish);
 	qp->SetAppSentCallback(notifyAppSent);
-	// add qp
-	uint32_t nic_idx = GetNicIdxOfQp(qp);
 
-	// std::cout << "src is: " << src << ", dst is: " << dest <<  ", nic_idx: " << nic_idx << ", and the m_nic size is: " << m_nic.size() << std::endl;
-	// Assign the qp to specific qbbnetdevice
+	uint32_t nic_idx = GetNicIdxOfQp(qp);
 	m_nic[nic_idx].qpGrp->AddQp(qp);
 	uint64_t key = GetQpKey(dip.Get(), sport, pg);
 	m_qpMap[key] = qp;
@@ -294,7 +397,6 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 	last_qp_cnp[key] = 0;
 	last_qp_rate[key] = 0;
 
-	// set init variables
 	DataRate m_bps = m_nic[nic_idx].dev->GetDataRate();
 	qp->m_rate = m_bps;
 	qp->m_max_rate = m_bps;
@@ -311,12 +413,41 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 	}else if (m_cc_mode == 10){
 		qp->hpccPint.m_curRate = m_bps;
 	}
-	// NVLS settings
+
 	if(nvls_enable == 1) qp->nvls_enable = 1;
 	else qp->nvls_enable = 0;
-	// Notify Nic
-	m_nic[nic_idx].dev->NewQp(qp);
+
+	if (initialPostedBytes > 0){
+		m_nic[nic_idx].dev->NewQp(qp);
+	}
+	return qp;
 }
+
+void RdmaHw::PostWork(Ptr<RdmaQueuePair> qp, uint64_t bytes){
+	if (qp == NULL || bytes == 0){
+		return;
+	}
+
+	uint64_t oldLimit = qp->GetPostedLimit();
+	qp->AddPostedBytes(bytes);
+	uint64_t newLimit = qp->GetPostedLimit();
+
+	if (newLimit == oldLimit){
+		return;
+	}
+
+	NS_ASSERT(qp->snd_una <= qp->snd_nxt);
+	NS_ASSERT(qp->snd_nxt <= qp->GetPostedLimit());
+	NS_ASSERT(qp->GetPostedLimit() <= qp->m_size);
+
+	uint32_t nicIdx = GetNicIdxOfQp(qp);
+	m_nic[nicIdx].dev->NewQp(qp);
+}
+
+void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Address dip, uint16_t sport, uint16_t dport, uint32_t win, uint64_t baseRtt, Callback<void> notifyAppFinish, Callback<void> notifyAppSent){
+	CreateQueuePair(src, dest, tag, size, pg, sip, dip, sport, dport, win, baseRtt, notifyAppFinish, notifyAppSent, size);
+}
+
 
 void RdmaHw::DeleteQueuePair(Ptr<RdmaQueuePair> qp){
 	// remove qp from the m_qpMap
@@ -532,6 +663,9 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 			uint64_t goback_seq = seq / m_chunk * m_chunk;
 			qp->Acknowledge(goback_seq);
 		}
+		if (ch.l3Prot == 0xFC && !m_qpProgressCallback.IsNull()){
+			m_qpProgressCallback(qp);
+		}
 		if (qp->IsFinished()){
 			QpComplete(qp);
 		}
@@ -624,6 +758,9 @@ uint16_t RdmaHw::EtherToPpp (uint16_t proto){
 }
 
 void RdmaHw::RecoverQueue(Ptr<RdmaQueuePair> qp){
+	if (!m_qpRecoverCallback.IsNull()){
+		m_qpRecoverCallback(qp);
+	}
 	qp->snd_nxt = qp->snd_una;
 }
 

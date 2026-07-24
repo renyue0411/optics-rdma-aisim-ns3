@@ -45,7 +45,18 @@ public:
 	std::unordered_map<uint64_t, Ptr<RdmaQueuePair> > m_qpMap; // mapping from uint64_t to qp
 	std::unordered_map<uint64_t, Ptr<RdmaRxQueuePair> > m_rxQpMap; // mapping from uint64_t to rx qp
 	std::unordered_map<uint32_t, std::vector<int> > m_rtTable; // map from ip address (u32) to possible ECMP port (index of dev)
-	std::unordered_map<uint32_t, std::vector<int> > m_rtTable_nxthop_nvswitch; // map from ip address (u32) to possible ECMP port (index of dev) connected to nvswitch
+	std::unordered_map<uint32_t, std::vector<int> > m_rtTable_nxthop_nvswitch;
+
+	struct RnicGateSlotEntry{
+		uint64_t startOffsetNs;
+		uint64_t endOffsetNs;
+		std::vector<uint64_t> dstRnicBitmapWords;
+	};
+	bool m_rnicGateEnabled;
+	uint32_t m_rnicGateRnicId;
+	uint64_t m_rnicGateEpochStartNs;
+	uint64_t m_rnicGatePeriodNs;
+	std::vector<RnicGateSlotEntry> m_rnicGateSlots; // map from ip address (u32) to possible ECMP port (index of dev) connected to nvswitch
 	uint32_t m_gpus_per_server; // uesed for routing; if src and dst in the same server, then communicate by nvswitch.
 	uint32_t nvls_enable;
 	std::set<uint32_t> nvswitch_set;
@@ -55,6 +66,10 @@ public:
 	QpCompleteCallback m_qpCompleteCallback;
     typedef Callback<void, Ptr<RdmaQueuePair> > SendCompleteCallback;
     SendCompleteCallback m_sendCompleteCallback;
+	typedef Callback<void, Ptr<RdmaQueuePair> > QpProgressCallback;
+	typedef Callback<void, Ptr<RdmaQueuePair> > QpRecoverCallback;
+	QpProgressCallback m_qpProgressCallback;
+	QpRecoverCallback m_qpRecoverCallback;
 
     // for monitor
 	std::vector<uint64_t> tx_bytes; // <port_id, tx_bytes>
@@ -73,10 +88,18 @@ public:
 	void add_nvswitch(uint32_t nvswitch_id);
 
 	void SetNode(Ptr<Node> node);
-	void Setup(QpCompleteCallback cb,SendCompleteCallback send_cb); // setup shared data and callbacks with the QbbNetDevice
+	void Setup(QpCompleteCallback cb,SendCompleteCallback send_cb);
+	void SetQpProgressCallback(QpProgressCallback cb);
+	void SetQpRecoverCallback(QpRecoverCallback cb);
+	void EnableRnicGate(uint32_t rnicId, uint64_t epochStartNs, uint64_t periodNs, const std::vector<RnicGateSlotEntry> &slots);
+	void DisableRnicGate();
+	bool RnicGateAllowsQp(Ptr<RdmaQueuePair> qp) const;
+	Time GetNextRnicGateTime(Ptr<RdmaQueuePair> qp) const; // setup shared data and callbacks with the QbbNetDevice
 	static uint64_t GetQpKey(uint32_t dip, uint16_t sport, uint16_t pg); // get the lookup key for m_qpMap
 	Ptr<RdmaQueuePair> GetQp(uint32_t dip, uint16_t sport, uint16_t pg); // get the qp
 	uint32_t GetNicIdxOfQp(Ptr<RdmaQueuePair> qp); // get the NIC index of the qp
+	Ptr<RdmaQueuePair> CreateQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t size, uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, uint16_t _sport, uint16_t _dport, uint32_t win, uint64_t baseRtt, Callback<void> notifyAppFinish, Callback<void> notifyAppSent, uint64_t initialPostedBytes);
+	void PostWork(Ptr<RdmaQueuePair> qp, uint64_t bytes);
 	void AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t size, uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, uint16_t _sport, uint16_t _dport, uint32_t win, uint64_t baseRtt, Callback<void> notifyAppFinish, Callback<void> notifyAppSent); // add a new qp (new send)
 	void DeleteQueuePair(Ptr<RdmaQueuePair> qp);
 

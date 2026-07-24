@@ -41,6 +41,7 @@ public:
 	static uint32_t ack_q_idx;
 	int m_qlast;
 	uint32_t m_rrlast;
+	Time m_nextGateWake;
 	Ptr<SimpleDropTailQueue> m_ackQ; // highest priority queue
 	//Ptr<RedQueue> m_ackQ; 
 	Ptr<RdmaQueuePairGroup> m_qpGrp; // queue pairs
@@ -48,11 +49,16 @@ public:
 	// callback for get next packet
 	typedef Callback<Ptr<Packet>, Ptr<RdmaQueuePair> > RdmaGetNxtPkt;
 	RdmaGetNxtPkt m_rdmaGetNxtPkt;
+	typedef Callback<bool, Ptr<RdmaQueuePair> > QpGateAllowCallback;
+	typedef Callback<Time, Ptr<RdmaQueuePair> > QpGateNextTimeCallback;
+	QpGateAllowCallback m_rdmaGateAllowQp;
+	QpGateNextTimeCallback m_rdmaGateNextTime;
 
 	static TypeId GetTypeId (void);
 	RdmaEgressQueue();
 	Ptr<Packet> DequeueQindex(int qIndex);
 	int GetNextQindex(bool paused[]);
+	Time GetNextGateWake(void) const;
 	int GetLastQueue();
 	uint32_t GetNBytes(uint32_t qIndex);
 	uint32_t GetFlowCount(void);
