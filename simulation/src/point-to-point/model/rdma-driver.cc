@@ -56,11 +56,11 @@ void RdmaDriver::Init(void){
 	// RdmaHw do setup
 	m_rdma->SetNode(m_node);
     m_rdma->Setup(MakeCallback(&RdmaDriver::QpComplete, this),MakeCallback(&RdmaDriver::SendComplete, this));
-	m_userspaceTransport = CreateObject<RdmaUserspaceTransport>();
-	m_userspaceTransport->SetNode(m_node);
-	m_userspaceTransport->SetRdmaHw(m_rdma);
-	m_rdma->SetQpProgressCallback(MakeCallback(&RdmaUserspaceTransport::NotifyAckProgress, m_userspaceTransport));
-	m_rdma->SetQpRecoverCallback(MakeCallback(&RdmaUserspaceTransport::NotifyRecover, m_userspaceTransport));
+	m_transport = CreateObject<RdmaTransport>();
+	m_transport->SetNode(m_node);
+	m_transport->SetRdmaHw(m_rdma);
+	m_rdma->SetQpProgressCallback(MakeCallback(&RdmaTransport::NotifyAckProgress, m_transport));
+	m_rdma->SetQpRecoverCallback(MakeCallback(&RdmaTransport::NotifyRecover, m_transport));
 }
 
 void RdmaDriver::SetNode(Ptr<Node> node){
@@ -74,7 +74,7 @@ void RdmaDriver::SetRdmaHw(Ptr<RdmaHw> rdma){
 void RdmaDriver::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Address dip, uint16_t sport, uint16_t dport, uint32_t win, uint64_t baseRtt, Callback<void> notifyAppFinish, Callback<void> notifyAppSent){
 	if (m_injectionMode == INJECTION_USERSPACE){
 		Ptr<RdmaQueuePair> qp = m_rdma->CreateQueuePair(src, dest, tag, size, pg, sip, dip, sport, dport, win, baseRtt, notifyAppFinish, notifyAppSent, 0);
-		m_userspaceTransport->RegisterQp(qp);
+		m_transport->RegisterQp(qp);
 		return;
 	}
 	m_rdma->AddQueuePair(src, dest, tag, size, pg, sip, dip, sport, dport, win, baseRtt, notifyAppFinish, notifyAppSent);
@@ -101,21 +101,18 @@ void RdmaDriver::SetInjectionMode(uint32_t mode){
 	NS_ASSERT_MSG(mode <= INJECTION_USERSPACE, "injection mode must be 0, 1, or 2");
 	m_injectionMode = mode;
 
-	if (m_userspaceTransport != NULL){
-		m_userspaceTransport->SetEnabled(mode == INJECTION_USERSPACE);
-	}
-	if (mode != INJECTION_RNIC && m_rdma != NULL){
-		m_rdma->DisableRnicGate();
+	if (m_transport != NULL){
+		m_transport->SetMode(mode);
 	}
 }
 
-void RdmaDriver::ConfigureUserspaceTransport(uint64_t wrChunkBytes, uint64_t maxOutstandingBytes){
-	NS_ASSERT(m_userspaceTransport != NULL);
-	m_userspaceTransport->Configure(wrChunkBytes, maxOutstandingBytes);
+void RdmaDriver::ConfigureTransport(uint64_t wrChunkBytes, uint64_t maxOutstandingBytes){
+	NS_ASSERT(m_transport != NULL);
+	m_transport->Configure(wrChunkBytes, maxOutstandingBytes);
 }
 
-Ptr<RdmaUserspaceTransport> RdmaDriver::GetUserspaceTransport() const{
-	return m_userspaceTransport;
+Ptr<RdmaTransport> RdmaDriver::GetTransport() const{
+	return m_transport;
 }
 
 } // namespace ns3

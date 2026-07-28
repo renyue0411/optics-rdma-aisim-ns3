@@ -1,5 +1,5 @@
-#ifndef RDMA_USERSPACE_TRANSPORT_H
-#define RDMA_USERSPACE_TRANSPORT_H
+#ifndef RDMA_TRANSPORT_H
+#define RDMA_TRANSPORT_H
 
 #include "ns3/object.h"
 #include "ns3/node.h"
@@ -13,17 +13,33 @@
 
 namespace ns3 {
 
-class RdmaUserspaceTransport : public Object
+class RdmaTransport : public Object
 {
 public:
     static TypeId GetTypeId(void);
 
-    RdmaUserspaceTransport();
+    RdmaTransport();
 
     void SetNode(Ptr<Node> node);
     void SetRdmaHw(Ptr<RdmaHw> rdma);
 
-    void SetEnabled(bool enabled);
+    enum GateMode
+    {
+        MODE_DEFAULT = 0,
+        MODE_RNIC = 1,
+        MODE_USERSPACE = 2
+    };
+
+    struct GateSlotEntry
+    {
+        uint64_t startOffsetNs;
+        uint64_t endOffsetNs;
+        std::vector<uint64_t> dstRnicBitmapWords;
+    };
+
+    void SetMode(uint32_t mode);
+    GateMode GetMode() const;
+    void SetEnabled(bool enabled); // compatibility helper; SetMode() is preferred
 
     void Configure(
         uint64_t wrChunkBytes,
@@ -39,13 +55,17 @@ public:
         uint32_t activeQpHint,
         bool realDeploymentMode);
 
-    void EnableInjectionGate(
+    void InstallGateTable(
         uint32_t rnicId,
         uint64_t epochStartNs,
         uint64_t periodNs,
-        const std::vector<RdmaHw::RnicGateSlotEntry>& slots);
+        const std::vector<GateSlotEntry>& slots);
 
-    void DisableInjectionGate();
+    // Mode-1 callbacks invoked from the RdmaHw egress scheduling point.
+    bool RnicGateAllowsQp(Ptr<RdmaQueuePair> qp) const;
+    Time GetNextRnicGateTime(Ptr<RdmaQueuePair> qp) const;
+
+    void ClearGateTables();
 
     void RegisterQp(Ptr<RdmaQueuePair> qp);
     void NotifyAckProgress(Ptr<RdmaQueuePair> qp);
@@ -107,17 +127,22 @@ private:
     Ptr<Node> m_node;
     Ptr<RdmaHw> m_rdma;
 
-    bool m_enabled;
+    GateMode m_mode;
+    bool m_enabled; // userspace admission active only in MODE_USERSPACE
     bool m_gateEnabled;
 
-    uint32_t m_rnicId;
-    uint64_t m_epochStartNs;
-    uint64_t m_periodNs;
+    struct GateTable
+    {
+        uint64_t epochStartNs;
+        uint64_t periodNs;
+        std::vector<GateSlotEntry> slots;
+    };
+
+    std::map<uint32_t, GateTable> m_gateTables;
 
     uint64_t m_wrChunkBytes;
     uint64_t m_maxOutstandingBytes;
 
-    std::vector<RdmaHw::RnicGateSlotEntry> m_slots;
     std::map<uint64_t, EventId> m_wakeEvents;
 
     uint64_t m_safeRateBps;

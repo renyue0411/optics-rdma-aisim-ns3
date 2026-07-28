@@ -46,17 +46,34 @@ public:
 	std::unordered_map<uint64_t, Ptr<RdmaRxQueuePair> > m_rxQpMap; // mapping from uint64_t to rx qp
 	std::unordered_map<uint32_t, std::vector<int> > m_rtTable; // map from ip address (u32) to possible ECMP port (index of dev)
 	std::unordered_map<uint32_t, std::vector<int> > m_rtTable_nxthop_nvswitch;
+	struct RnicInterfaceIdentity {
+		uint32_t rnicPortId;
+		uint32_t physicalNicId;
+		uint32_t planeId;
 
-	struct RnicGateSlotEntry{
-		uint64_t startOffsetNs;
-		uint64_t endOffsetNs;
-		std::vector<uint64_t> dstRnicBitmapWords;
+		RnicInterfaceIdentity()
+			: rnicPortId(0), physicalNicId(0), planeId(0) {}
+		RnicInterfaceIdentity(uint32_t portId, uint32_t nicId, uint32_t plane)
+			: rnicPortId(portId), physicalNicId(nicId), planeId(plane) {}
 	};
-	bool m_rnicGateEnabled;
-	uint32_t m_rnicGateRnicId;
-	uint64_t m_rnicGateEpochStartNs;
-	uint64_t m_rnicGatePeriodNs;
-	std::vector<RnicGateSlotEntry> m_rnicGateSlots; // map from ip address (u32) to possible ECMP port (index of dev) connected to nvswitch
+
+	std::unordered_map<uint32_t, uint32_t> m_rnicPortToNicIdx; // stable RNIC port -> QbbNetDevice index
+	std::unordered_map<uint32_t, uint32_t> m_nicIdxToRnicPort; // reverse mapping used when binding a QP
+	std::unordered_map<uint32_t, RnicInterfaceIdentity> m_nicIdxToRnicIdentity;
+	std::unordered_map<uint64_t, uint32_t> m_nicPlaneToNicIdx;
+
+	enum ScaleOutPlaneScheduler {
+		SCALE_OUT_HASH = 0,
+		SCALE_OUT_ROUND_ROBIN = 1,
+		SCALE_OUT_LEAST_QP = 2
+	};
+	uint32_t m_scaleOutPlaneScheduler;
+	std::unordered_map<uint32_t, uint32_t> m_scaleOutRrCursor;
+
+	typedef Callback<bool, Ptr<RdmaQueuePair> > RnicGateAllowCallback;
+	typedef Callback<Time, Ptr<RdmaQueuePair> > RnicGateNextTimeCallback;
+	RnicGateAllowCallback m_rnicGateAllowCallback;
+	RnicGateNextTimeCallback m_rnicGateNextTimeCallback;
 	uint32_t m_gpus_per_server; // uesed for routing; if src and dst in the same server, then communicate by nvswitch.
 	uint32_t nvls_enable;
 	std::set<uint32_t> nvswitch_set;
@@ -88,16 +105,31 @@ public:
 	void add_nvswitch(uint32_t nvswitch_id);
 
 	void SetNode(Ptr<Node> node);
+	static uint32_t EncodeRnicPortId(uint32_t physicalNicId, uint32_t planeId);
+	static uint64_t MakeNicPlaneKey(uint32_t physicalNicId, uint32_t planeId);
+	void RegisterRnicPort(uint32_t portId, uint32_t nicIdx); // legacy compatibility
+	void RegisterRnicInterface(uint32_t portId,
+	                           uint32_t physicalNicId,
+	                           uint32_t planeId,
+	                           uint32_t nicIdx);
+	bool GetRnicPortId(uint32_t nicIdx, uint32_t &portId) const;
+	bool GetRnicInterfaceIdentity(uint32_t nicIdx, RnicInterfaceIdentity &identity) const;
+	bool GetNicIdxForNicPlane(uint32_t physicalNicId, uint32_t planeId, uint32_t &nicIdx) const;
 	void Setup(QpCompleteCallback cb,SendCompleteCallback send_cb);
 	void SetQpProgressCallback(QpProgressCallback cb);
 	void SetQpRecoverCallback(QpRecoverCallback cb);
-	void EnableRnicGate(uint32_t rnicId, uint64_t epochStartNs, uint64_t periodNs, const std::vector<RnicGateSlotEntry> &slots);
-	void DisableRnicGate();
+	void SetRnicGateCallbacks(RnicGateAllowCallback allowCb,
+	                          RnicGateNextTimeCallback nextTimeCb);
+	void ClearRnicGateCallbacks();
 	bool RnicGateAllowsQp(Ptr<RdmaQueuePair> qp) const;
 	Time GetNextRnicGateTime(Ptr<RdmaQueuePair> qp) const; // setup shared data and callbacks with the QbbNetDevice
 	static uint64_t GetQpKey(uint32_t dip, uint16_t sport, uint16_t pg); // get the lookup key for m_qpMap
 	Ptr<RdmaQueuePair> GetQp(uint32_t dip, uint16_t sport, uint16_t pg); // get the qp
 	uint32_t GetNicIdxOfQp(Ptr<RdmaQueuePair> qp); // get the NIC index of the qp
+	uint32_t SelectScaleOutNic(Ptr<RdmaQueuePair> qp, const std::vector<int> &candidates);
+	uint32_t GetNicIdxForDevice(Ptr<QbbNetDevice> dev) const;
+	void BindTxQpToNic(Ptr<RdmaQueuePair> qp, uint32_t nicIdx);
+	void BindRxQpToIngress(Ptr<RdmaRxQueuePair> qp, uint32_t nicIdx);
 	Ptr<RdmaQueuePair> CreateQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t size, uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, uint16_t _sport, uint16_t _dport, uint32_t win, uint64_t baseRtt, Callback<void> notifyAppFinish, Callback<void> notifyAppSent, uint64_t initialPostedBytes);
 	void PostWork(Ptr<RdmaQueuePair> qp, uint64_t bytes);
 	void AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t size, uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, uint16_t _sport, uint16_t _dport, uint32_t win, uint64_t baseRtt, Callback<void> notifyAppFinish, Callback<void> notifyAppSent); // add a new qp (new send)
@@ -107,10 +139,10 @@ public:
 	uint32_t GetNicIdxOfRxQp(Ptr<RdmaRxQueuePair> q); // get the NIC index of the rxQp
 	void DeleteRxQp(uint32_t dip, uint16_t pg, uint16_t dport);
 
-	int ReceiveUdp(Ptr<Packet> p, CustomHeader &ch);
+	int ReceiveUdp(Ptr<QbbNetDevice> ingressDev, Ptr<Packet> p, CustomHeader &ch);
 	int ReceiveCnp(Ptr<Packet> p, CustomHeader &ch);
 	int ReceiveAck(Ptr<Packet> p, CustomHeader &ch); // handle both ACK and NACK
-	int Receive(Ptr<Packet> p, CustomHeader &ch); // callback function that the QbbNetDevice should use when receive packets. Only NIC can call this function. And do not call this upon PFC
+	int Receive(Ptr<QbbNetDevice> ingressDev, Ptr<Packet> p, CustomHeader &ch); // callback used by the receiving QbbNetDevice
 
 	void PCIePause(uint32_t nic_idx, uint32_t qIndex);
 	void PCIeResume(uint32_t nic_idx, uint32_t qIndex);

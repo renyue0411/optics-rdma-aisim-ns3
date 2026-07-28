@@ -37,6 +37,11 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_ipid = 0;
 	m_win = 0;
 	m_baseRtt = 0;
+	m_hasBoundRnicPort = false;
+	m_boundRnicPort = 0;
+	m_boundNicIdx = 0;
+	m_boundPhysicalNicId = 0;
+	m_boundPlaneId = 0;
 	m_max_rate = 0;
 	m_var_win = false;
 	m_rate = 0;
@@ -247,6 +252,11 @@ RdmaRxQueuePair::RdmaRxQueuePair(){
 	m_nackTimer = Time(0);
 	m_milestone_rx = 0;
 	m_lastNACK = 0;
+	m_hasBoundRnicPort = false;
+	m_boundRnicPort = 0;
+	m_boundNicIdx = 0;
+	m_boundPhysicalNicId = 0;
+	m_boundPlaneId = 0;
 }
 
 uint32_t RdmaRxQueuePair::GetHash(void){

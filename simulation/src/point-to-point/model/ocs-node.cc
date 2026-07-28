@@ -389,14 +389,6 @@ OcsNode::SwitchReceiveFromDevice(Ptr<NetDevice> device,
     {
       m_dropSwitching++;
 
-      std::cout << "[OCS DROP SWITCHING]"
-                << " t=" << Simulator::Now().GetTimeStep()
-                << " node=" << GetId()
-                << " inPort=" << inPort
-                << " slice=" << GetCurrentSlice()
-                << " drop_switching=" << m_dropSwitching
-                << std::endl;
-
       return true;
     }
 

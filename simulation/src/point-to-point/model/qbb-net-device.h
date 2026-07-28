@@ -205,7 +205,7 @@ public:
   typedef Callback<int, Ptr<Packet>, CustomHeader &> RdmaSentCb;
   RdmaSentCb m_rdmaSentCb;
   // callback for processing packet in RDMA
-	typedef Callback<int, Ptr<Packet>, CustomHeader&> RdmaReceiveCb;
+	typedef Callback<int, Ptr<QbbNetDevice>, Ptr<Packet>, CustomHeader&> RdmaReceiveCb;
 	RdmaReceiveCb m_rdmaReceiveCb;
 	// callback for link down
 	typedef Callback<void, Ptr<QbbNetDevice> > RdmaLinkDownCb;

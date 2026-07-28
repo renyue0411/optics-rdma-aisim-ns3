@@ -1,4 +1,4 @@
-#include "rdma-userspace-transport.h"
+#include "rdma-transport.h"
 
 #include "ns3/simulator.h"
 #include "ns3/assert.h"
@@ -11,28 +11,26 @@
 
 namespace ns3 {
 
-NS_LOG_COMPONENT_DEFINE("RdmaUserspaceTransport");
-NS_OBJECT_ENSURE_REGISTERED(RdmaUserspaceTransport);
+NS_LOG_COMPONENT_DEFINE("RdmaTransport");
+NS_OBJECT_ENSURE_REGISTERED(RdmaTransport);
 
 TypeId
-RdmaUserspaceTransport::GetTypeId(void)
+RdmaTransport::GetTypeId(void)
 {
     static TypeId tid =
-        TypeId("ns3::RdmaUserspaceTransport")
+        TypeId("ns3::RdmaTransport")
             .SetParent<Object>()
-            .AddConstructor<RdmaUserspaceTransport>();
+            .AddConstructor<RdmaTransport>();
 
     return tid;
 }
 
-RdmaUserspaceTransport::RdmaUserspaceTransport()
+RdmaTransport::RdmaTransport()
     : m_node(NULL),
       m_rdma(NULL),
+      m_mode(MODE_DEFAULT),
       m_enabled(false),
       m_gateEnabled(false),
-      m_rnicId(0),
-      m_epochStartNs(0),
-      m_periodNs(0),
       m_wrChunkBytes(16 * 1024),
       m_maxOutstandingBytes(64 * 1024),
       m_safeRateBps(30000000000ULL),
@@ -56,30 +54,62 @@ RdmaUserspaceTransport::RdmaUserspaceTransport()
       m_switchingGuardNs(0),
       m_maxObservedRttNs(10000),
       m_activeQpHint(1),
-      m_postLogSampleLimit(8)
+      m_postLogSampleLimit(0)
 {
 }
 
 void
-RdmaUserspaceTransport::SetNode(Ptr<Node> node)
+RdmaTransport::SetNode(Ptr<Node> node)
 {
     m_node = node;
 }
 
 void
-RdmaUserspaceTransport::SetRdmaHw(Ptr<RdmaHw> rdma)
+RdmaTransport::SetRdmaHw(Ptr<RdmaHw> rdma)
 {
     m_rdma = rdma;
 }
 
 void
-RdmaUserspaceTransport::SetEnabled(bool enabled)
+RdmaTransport::SetMode(uint32_t mode)
 {
-    m_enabled = enabled;
+    NS_ASSERT_MSG(mode <= MODE_USERSPACE,
+                  "RDMA transport mode must be 0(default), 1(RNIC), or 2(userspace)");
+
+    m_mode = static_cast<GateMode>(mode);
+    m_enabled = (m_mode == MODE_USERSPACE);
+
+    if (m_rdma == NULL)
+    {
+        return;
+    }
+
+    if (m_mode == MODE_RNIC)
+    {
+        m_rdma->SetRnicGateCallbacks(
+            MakeCallback(&RdmaTransport::RnicGateAllowsQp, this),
+            MakeCallback(&RdmaTransport::GetNextRnicGateTime, this));
+    }
+    else
+    {
+        m_rdma->ClearRnicGateCallbacks();
+    }
+}
+
+RdmaTransport::GateMode
+RdmaTransport::GetMode() const
+{
+    return m_mode;
 }
 
 void
-RdmaUserspaceTransport::Configure(
+RdmaTransport::SetEnabled(bool enabled)
+{
+    SetMode(enabled ? MODE_USERSPACE : MODE_DEFAULT);
+}
+
+void
+RdmaTransport::Configure(
     uint64_t wrChunkBytes,
     uint64_t maxOutstandingBytes)
 {
@@ -107,7 +137,7 @@ RdmaUserspaceTransport::Configure(
 
 
 void
-RdmaUserspaceTransport::ConfigureBandwidthNormalized(
+RdmaTransport::ConfigureBandwidthNormalized(
     uint64_t bottleneckRateBps,
     uint64_t switchingGuardNs,
     uint64_t maxRttNs,
@@ -138,7 +168,7 @@ RdmaUserspaceTransport::ConfigureBandwidthNormalized(
 }
 
 uint64_t
-RdmaUserspaceTransport::ClampValue(
+RdmaTransport::ClampValue(
     uint64_t value,
     uint64_t minValue,
     uint64_t maxValue) const
@@ -162,7 +192,7 @@ RdmaUserspaceTransport::ClampValue(
 }
 
 uint64_t
-RdmaUserspaceTransport::RoundUpPowerOfTwo(uint64_t value) const
+RdmaTransport::RoundUpPowerOfTwo(uint64_t value) const
 {
     if (value <= 1)
     {
@@ -182,7 +212,7 @@ RdmaUserspaceTransport::RoundUpPowerOfTwo(uint64_t value) const
 }
 
 uint64_t
-RdmaUserspaceTransport::GetLocalBottleneckRateBps() const
+RdmaTransport::GetLocalBottleneckRateBps() const
 {
     if (m_node == NULL)
     {
@@ -217,34 +247,37 @@ RdmaUserspaceTransport::GetLocalBottleneckRateBps() const
 }
 
 uint64_t
-RdmaUserspaceTransport::InferSwitchingGuardNs() const
+RdmaTransport::InferSwitchingGuardNs() const
 {
     uint64_t minSlotNs = std::numeric_limits<uint64_t>::max();
-
-    for (uint32_t i = 0; i < m_slots.size(); ++i)
+    for (std::map<uint32_t, GateTable>::const_iterator tableIt =
+             m_gateTables.begin();
+         tableIt != m_gateTables.end();
+         ++tableIt)
     {
-        const RdmaHw::RnicGateSlotEntry& slot = m_slots[i];
-        if (slot.endOffsetNs <= slot.startOffsetNs)
+        for (uint32_t i = 0; i < tableIt->second.slots.size(); ++i)
         {
-            continue;
+            const RdmaTransport::GateSlotEntry& slot =
+                tableIt->second.slots[i];
+            if (slot.endOffsetNs > slot.startOffsetNs)
+            {
+                minSlotNs = std::min(
+                    minSlotNs,
+                    slot.endOffsetNs - slot.startOffsetNs);
+            }
         }
-
-        minSlotNs = std::min(
-            minSlotNs,
-            slot.endOffsetNs - slot.startOffsetNs);
     }
 
     if (minSlotNs == std::numeric_limits<uint64_t>::max() ||
         minSlotNs > 1000000ULL)
     {
-        return 10000ULL; // 10 us fallback for scheduled OCS switching.
+        return 10000ULL;
     }
-
     return std::max<uint64_t>(10000ULL, minSlotNs);
 }
 
 void
-RdmaUserspaceTransport::ApplyBandwidthNormalizedConfig(const char* reason)
+RdmaTransport::ApplyBandwidthNormalizedConfig(const char* reason)
 {
     if (!m_autoBandwidthConfig)
     {
@@ -266,7 +299,7 @@ RdmaUserspaceTransport::ApplyBandwidthNormalizedConfig(const char* reason)
 
     uint64_t effectiveSwitchingGuardNs = m_switchingGuardNs;
 
-    if (effectiveSwitchingGuardNs == 0 && !m_slots.empty())
+    if (effectiveSwitchingGuardNs == 0 && !m_gateTables.empty())
     {
         m_switchingGuardNs = InferSwitchingGuardNs();
         effectiveSwitchingGuardNs = m_switchingGuardNs;
@@ -404,12 +437,14 @@ RdmaUserspaceTransport::ApplyBandwidthNormalizedConfig(const char* reason)
         oldWrChunkBytes != m_wrChunkBytes ||
         oldMinPostBytes != m_minPostBytes;
 
-    if (changed)
+    // The transport object is initialized for every RDMA mode, but its
+    // bandwidth/admission diagnostics are meaningful only in userspace mode.
+    if (changed && m_enabled)
     {
         std::cout
             << "[USERSPACE BW INIT]"
             << " reason=" << (reason != 0 ? reason : "unknown")
-            << " rnic=" << m_rnicId
+            << " gate_tables=" << m_gateTables.size()
             << " bottleneckRateBps=" << bottleneckRateBps
             << " activeQpHint=" << activeQps
             << " safeFactorPermille=" << safeFactorPermille
@@ -429,45 +464,42 @@ RdmaUserspaceTransport::ApplyBandwidthNormalizedConfig(const char* reason)
 }
 
 void
-RdmaUserspaceTransport::EnableInjectionGate(
+RdmaTransport::InstallGateTable(
     uint32_t rnicId,
     uint64_t epochStartNs,
     uint64_t periodNs,
-    const std::vector<RdmaHw::RnicGateSlotEntry>& slots)
+    const std::vector<RdmaTransport::GateSlotEntry>& slots)
 {
-    NS_ASSERT_MSG(
-        periodNs > 0,
-        "userspace injection period must be positive");
+    NS_ASSERT_MSG(periodNs > 0,
+                  "userspace injection period must be positive");
 
-    m_gateEnabled = true;
-    m_rnicId = rnicId;
-    m_epochStartNs = epochStartNs;
-    m_periodNs = periodNs;
-    m_slots = slots;
-    m_adaptPeriodNs = periodNs > 0 ? periodNs : 30000000ULL;
-    m_lastAdaptNs = static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
+    GateTable table;
+    table.epochStartNs = epochStartNs;
+    table.periodNs = periodNs;
+    table.slots = slots;
+    m_gateTables[rnicId] = table;
+    m_gateEnabled = !m_gateTables.empty();
+    m_adaptPeriodNs = periodNs;
+    m_lastAdaptNs =
+        static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
 
     ApplyBandwidthNormalizedConfig("enable_gate");
 
-    std::cout
-        << "[USERSPACE GATE INSTALLED]"
-        << " rnic=" << rnicId
-        << " epochNs=" << epochStartNs
-        << " periodNs=" << periodNs
-        << " slots=" << slots.size()
-        << " safeRateBps=" << m_safeRateBps
-        << " tailGuardNs=" << m_tailGuardNs
-        << " wrChunkBytes=" << m_wrChunkBytes
-        << " maxOutstandingBytes=" << m_maxOutstandingBytes
-        << " minPostBytes=" << m_minPostBytes
-        << std::endl;
+    std::cout << "[RDMA TRANSPORT GATE INSTALLED]"
+              << " mode=" << static_cast<uint32_t>(m_mode)
+              << " rnic_port=" << rnicId
+              << " epochNs=" << epochStartNs
+              << " periodNs=" << periodNs
+              << " slots=" << slots.size()
+              << " tables=" << m_gateTables.size()
+              << std::endl;
 }
 
 void
-RdmaUserspaceTransport::DisableInjectionGate()
+RdmaTransport::ClearGateTables()
 {
     m_gateEnabled = false;
-    m_slots.clear();
+    m_gateTables.clear();
 
     for (std::map<uint64_t, EventId>::iterator it =
              m_wakeEvents.begin();
@@ -479,243 +511,176 @@ RdmaUserspaceTransport::DisableInjectionGate()
             it->second.Cancel();
         }
     }
-
     m_wakeEvents.clear();
 }
 
 bool
-RdmaUserspaceTransport::Allows(
-    Ptr<RdmaQueuePair> qp,
-    Time now) const
+RdmaTransport::RnicGateAllowsQp(Ptr<RdmaQueuePair> qp) const
 {
-    if (!m_gateEnabled ||
-        m_periodNs == 0 ||
-        qp == NULL)
+    if (m_mode != MODE_RNIC)
     {
         return true;
     }
+    return Allows(qp, Simulator::Now());
+}
 
-    uint32_t dstNodeId =
-        (qp->dip.Get() >> 8) & 0xffff;
-
-    uint64_t nowNs =
-        static_cast<uint64_t>(
-            now.GetNanoSeconds());
-
-    uint64_t offsetNs;
-
-    if (nowNs >= m_epochStartNs)
+Time
+RdmaTransport::GetNextRnicGateTime(Ptr<RdmaQueuePair> qp) const
+{
+    if (m_mode != MODE_RNIC)
     {
-        offsetNs =
-            (nowNs - m_epochStartNs) %
-            m_periodNs;
+        return Simulator::Now();
     }
-    else
+    return GetNextAllowedTime(qp, Simulator::Now());
+}
+
+bool
+RdmaTransport::Allows(
+    Ptr<RdmaQueuePair> qp,
+    Time now) const
+{
+    if (!m_gateEnabled || qp == NULL)
     {
-        offsetNs =
-            (m_periodNs -
-             ((m_epochStartNs - nowNs) %
-              m_periodNs)) %
-            m_periodNs;
+        return true;
+    }
+    if (!qp->m_hasBoundRnicPort)
+    {
+        return true; // scale-up QP bypasses OCS injection windows
     }
 
-    for (uint32_t i = 0;
-         i < m_slots.size();
-         ++i)
+    std::map<uint32_t, GateTable>::const_iterator tableIt =
+        m_gateTables.find(qp->m_boundRnicPort);
+    if (tableIt == m_gateTables.end() || tableIt->second.periodNs == 0)
     {
-        const RdmaHw::RnicGateSlotEntry& slot =
-            m_slots[i];
+        return false;
+    }
+    const GateTable& table = tableIt->second;
+    uint32_t dstNodeId = (qp->dip.Get() >> 8) & 0xffff;
+    uint64_t nowNs = static_cast<uint64_t>(now.GetNanoSeconds());
+    uint64_t offsetNs = nowNs >= table.epochStartNs
+        ? (nowNs - table.epochStartNs) % table.periodNs
+        : (table.periodNs -
+           ((table.epochStartNs - nowNs) % table.periodNs)) % table.periodNs;
 
-        if (offsetNs < slot.startOffsetNs ||
-            offsetNs >= slot.endOffsetNs)
+    for (uint32_t i = 0; i < table.slots.size(); ++i)
+    {
+        const RdmaTransport::GateSlotEntry& slot = table.slots[i];
+        if (offsetNs < slot.startOffsetNs || offsetNs >= slot.endOffsetNs)
         {
             continue;
         }
-
         uint32_t wordIndex = dstNodeId / 64;
         uint32_t bitIndex = dstNodeId % 64;
-
-        if (wordIndex >=
-            slot.dstRnicBitmapWords.size())
-        {
-            return false;
-        }
-
-        return
-            (slot.dstRnicBitmapWords[wordIndex] &
-             (1ULL << bitIndex)) != 0;
+        return wordIndex < slot.dstRnicBitmapWords.size() &&
+            (slot.dstRnicBitmapWords[wordIndex] & (1ULL << bitIndex)) != 0;
     }
-
     return false;
 }
 
 Time
-RdmaUserspaceTransport::GetNextAllowedTime(
+RdmaTransport::GetNextAllowedTime(
     Ptr<RdmaQueuePair> qp,
     Time now) const
 {
-    if (!m_gateEnabled ||
-        m_periodNs == 0 ||
-        qp == NULL)
+    if (!m_gateEnabled || qp == NULL || !qp->m_hasBoundRnicPort)
     {
         return now;
     }
 
-    uint32_t dstNodeId =
-        (qp->dip.Get() >> 8) & 0xffff;
-
-    uint64_t nowNs =
-        static_cast<uint64_t>(
-            now.GetNanoSeconds());
-
-    uint64_t offsetNs;
-
-    if (nowNs >= m_epochStartNs)
+    std::map<uint32_t, GateTable>::const_iterator tableIt =
+        m_gateTables.find(qp->m_boundRnicPort);
+    if (tableIt == m_gateTables.end() || tableIt->second.periodNs == 0)
     {
-        offsetNs =
-            (nowNs - m_epochStartNs) %
-            m_periodNs;
+        return Simulator::GetMaximumSimulationTime();
     }
-    else
+    const GateTable& table = tableIt->second;
+    uint32_t dstNodeId = (qp->dip.Get() >> 8) & 0xffff;
+    uint64_t nowNs = static_cast<uint64_t>(now.GetNanoSeconds());
+    uint64_t offsetNs = nowNs >= table.epochStartNs
+        ? (nowNs - table.epochStartNs) % table.periodNs
+        : (table.periodNs -
+           ((table.epochStartNs - nowNs) % table.periodNs)) % table.periodNs;
+    uint64_t bestDeltaNs = std::numeric_limits<uint64_t>::max();
+
+    for (uint32_t i = 0; i < table.slots.size(); ++i)
     {
-        offsetNs =
-            (m_periodNs -
-             ((m_epochStartNs - nowNs) %
-              m_periodNs)) %
-            m_periodNs;
-    }
-
-    uint64_t bestDeltaNs =
-        std::numeric_limits<uint64_t>::max();
-
-    for (uint32_t i = 0;
-         i < m_slots.size();
-         ++i)
-    {
-        const RdmaHw::RnicGateSlotEntry& slot =
-            m_slots[i];
-
+        const RdmaTransport::GateSlotEntry& slot = table.slots[i];
         uint32_t wordIndex = dstNodeId / 64;
         uint32_t bitIndex = dstNodeId % 64;
-
-        if (wordIndex >=
-            slot.dstRnicBitmapWords.size() ||
-            (slot.dstRnicBitmapWords[wordIndex] &
-             (1ULL << bitIndex)) == 0)
+        if (wordIndex >= slot.dstRnicBitmapWords.size() ||
+            (slot.dstRnicBitmapWords[wordIndex] & (1ULL << bitIndex)) == 0)
         {
             continue;
         }
-
-        uint64_t candidateDeltaNs;
-
-        if (offsetNs < slot.startOffsetNs)
-        {
-            candidateDeltaNs =
-                slot.startOffsetNs - offsetNs;
-        }
-        else if (offsetNs < slot.endOffsetNs)
-        {
-            candidateDeltaNs = 0;
-        }
-        else
-        {
-            candidateDeltaNs =
-                m_periodNs -
-                offsetNs +
-                slot.startOffsetNs;
-        }
-
-        bestDeltaNs =
-            std::min(
-                bestDeltaNs,
-                candidateDeltaNs);
+        uint64_t deltaNs = offsetNs < slot.startOffsetNs
+            ? slot.startOffsetNs - offsetNs
+            : (offsetNs < slot.endOffsetNs
+                ? 0
+                : table.periodNs - offsetNs + slot.startOffsetNs);
+        bestDeltaNs = std::min(bestDeltaNs, deltaNs);
     }
 
-    if (bestDeltaNs ==
-        std::numeric_limits<uint64_t>::max())
+    if (bestDeltaNs == std::numeric_limits<uint64_t>::max())
     {
-        return
-            Simulator::GetMaximumSimulationTime();
+        return Simulator::GetMaximumSimulationTime();
     }
-
     return now + NanoSeconds(bestDeltaNs);
 }
 
 Time
-RdmaUserspaceTransport::GetCurrentWindowEndTime(
+RdmaTransport::GetCurrentWindowEndTime(
     Ptr<RdmaQueuePair> qp,
     Time now) const
 {
-    if (!m_gateEnabled ||
-        m_periodNs == 0 ||
-        qp == NULL)
+    if (!m_gateEnabled || qp == NULL || !qp->m_hasBoundRnicPort)
     {
         return Simulator::GetMaximumSimulationTime();
     }
 
-    uint32_t dstNodeId =
-        (qp->dip.Get() >> 8) & 0xffff;
-
-    uint64_t nowNs =
-        static_cast<uint64_t>(
-            now.GetNanoSeconds());
-
-    uint64_t offsetNs;
-
-    if (nowNs >= m_epochStartNs)
+    std::map<uint32_t, GateTable>::const_iterator tableIt =
+        m_gateTables.find(qp->m_boundRnicPort);
+    if (tableIt == m_gateTables.end() || tableIt->second.periodNs == 0)
     {
-        offsetNs =
-            (nowNs - m_epochStartNs) %
-            m_periodNs;
+        return now;
     }
-    else
+    const GateTable& table = tableIt->second;
+    uint32_t dstNodeId = (qp->dip.Get() >> 8) & 0xffff;
+    uint64_t nowNs = static_cast<uint64_t>(now.GetNanoSeconds());
+    uint64_t offsetNs = nowNs >= table.epochStartNs
+        ? (nowNs - table.epochStartNs) % table.periodNs
+        : (table.periodNs -
+           ((table.epochStartNs - nowNs) % table.periodNs)) % table.periodNs;
+    uint64_t periodBaseNs = nowNs - offsetNs;
+
+    for (uint32_t i = 0; i < table.slots.size(); ++i)
     {
-        offsetNs =
-            (m_periodNs -
-             ((m_epochStartNs - nowNs) %
-              m_periodNs)) %
-            m_periodNs;
-    }
-
-    uint64_t periodBaseNs =
-        nowNs - offsetNs;
-
-    for (uint32_t i = 0;
-         i < m_slots.size();
-         ++i)
-    {
-        const RdmaHw::RnicGateSlotEntry& slot =
-            m_slots[i];
-
-        if (offsetNs < slot.startOffsetNs ||
-            offsetNs >= slot.endOffsetNs)
+        const RdmaTransport::GateSlotEntry& slot = table.slots[i];
+        if (offsetNs < slot.startOffsetNs || offsetNs >= slot.endOffsetNs)
         {
             continue;
         }
-
         uint32_t wordIndex = dstNodeId / 64;
         uint32_t bitIndex = dstNodeId % 64;
-
-        if (wordIndex >=
-            slot.dstRnicBitmapWords.size() ||
-            (slot.dstRnicBitmapWords[wordIndex] &
-             (1ULL << bitIndex)) == 0)
+        if (wordIndex >= slot.dstRnicBitmapWords.size() ||
+            (slot.dstRnicBitmapWords[wordIndex] & (1ULL << bitIndex)) == 0)
         {
             return now;
         }
-
-        return NanoSeconds(
-            periodBaseNs + slot.endOffsetNs);
+        return NanoSeconds(periodBaseNs + slot.endOffsetNs);
     }
-
     return now;
 }
 
 uint64_t
-RdmaUserspaceTransport::GetSafeBudgetBytes(
+RdmaTransport::GetSafeBudgetBytes(
     Ptr<RdmaQueuePair> qp,
     Time now) const
 {
+    if (qp != NULL && !qp->m_hasBoundRnicPort)
+    {
+        return m_maxOutstandingBytes;
+    }
+
     Time endTime =
         GetCurrentWindowEndTime(qp, now);
 
@@ -750,7 +715,7 @@ RdmaUserspaceTransport::GetSafeBudgetBytes(
 
 
 uint64_t
-RdmaUserspaceTransport::GetAdaptivePeriodNs() const
+RdmaTransport::GetAdaptivePeriodNs() const
 {
     return m_adaptPeriodNs > 0
         ? m_adaptPeriodNs
@@ -758,7 +723,7 @@ RdmaUserspaceTransport::GetAdaptivePeriodNs() const
 }
 
 void
-RdmaUserspaceTransport::MaybeAdapt(Ptr<RdmaQueuePair> qp)
+RdmaTransport::MaybeAdapt(Ptr<RdmaQueuePair> qp)
 {
     if (!m_enabled)
     {
@@ -907,7 +872,7 @@ RdmaUserspaceTransport::MaybeAdapt(Ptr<RdmaQueuePair> qp)
 }
 
 void
-RdmaUserspaceTransport::ScheduleNextWake(
+RdmaTransport::ScheduleNextWake(
     Ptr<RdmaQueuePair> qp,
     Time wakeTime)
 {
@@ -943,13 +908,13 @@ RdmaUserspaceTransport::ScheduleNextWake(
     m_wakeEvents[key] =
         Simulator::Schedule(
             wakeTime - now,
-            &RdmaUserspaceTransport::TrySubmit,
+            &RdmaTransport::TrySubmit,
             this,
             qp);
 }
 
 uint64_t
-RdmaUserspaceTransport::GetPostStatsKey(
+RdmaTransport::GetPostStatsKey(
     Ptr<RdmaQueuePair> qp) const
 {
     NS_ASSERT(qp != NULL);
@@ -961,7 +926,7 @@ RdmaUserspaceTransport::GetPostStatsKey(
 }
 
 void
-RdmaUserspaceTransport::RecordPost(
+RdmaTransport::RecordPost(
     Ptr<RdmaQueuePair> qp,
     uint64_t bytes,
     uint64_t safeBudget,
@@ -1032,7 +997,7 @@ RdmaUserspaceTransport::RecordPost(
 }
 
 void
-RdmaUserspaceTransport::FlushPostSummary(
+RdmaTransport::FlushPostSummary(
     Ptr<RdmaQueuePair> qp)
 {
     if (qp == NULL)
@@ -1088,7 +1053,7 @@ RdmaUserspaceTransport::FlushPostSummary(
 }
 
 void
-RdmaUserspaceTransport::TrySubmit(
+RdmaTransport::TrySubmit(
     Ptr<RdmaQueuePair> qp)
 {
     if (!m_enabled ||
@@ -1212,7 +1177,7 @@ RdmaUserspaceTransport::TrySubmit(
 }
 
 void
-RdmaUserspaceTransport::RegisterQp(
+RdmaTransport::RegisterQp(
     Ptr<RdmaQueuePair> qp)
 {
     NS_ASSERT(qp != NULL);
@@ -1227,7 +1192,7 @@ RdmaUserspaceTransport::RegisterQp(
 }
 
 void
-RdmaUserspaceTransport::NotifyAckProgress(
+RdmaTransport::NotifyAckProgress(
     Ptr<RdmaQueuePair> qp)
 {
     if (!m_enabled)
@@ -1262,7 +1227,7 @@ RdmaUserspaceTransport::NotifyAckProgress(
 }
 
 void
-RdmaUserspaceTransport::NotifyRecover(
+RdmaTransport::NotifyRecover(
     Ptr<RdmaQueuePair> qp)
 {
     if (!m_enabled)

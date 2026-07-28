@@ -8,7 +8,7 @@
 #include <ns3/rdma-hw.h>
 #include <vector>
 #include <unordered_map>
-#include <ns3/rdma-userspace-transport.h>
+#include <ns3/rdma-transport.h>
 
 namespace ns3 {
 
@@ -52,11 +52,11 @@ public:
 	};
 
 	uint32_t m_injectionMode;
-	Ptr<RdmaUserspaceTransport> m_userspaceTransport;
+	Ptr<RdmaTransport> m_transport;
 
 	void SetInjectionMode(uint32_t mode);
-	void ConfigureUserspaceTransport(uint64_t wrChunkBytes, uint64_t maxOutstandingBytes);
-	Ptr<RdmaUserspaceTransport> GetUserspaceTransport() const;
+	void ConfigureTransport(uint64_t wrChunkBytes, uint64_t maxOutstandingBytes);
+	Ptr<RdmaTransport> GetTransport() const;
 
 };
 

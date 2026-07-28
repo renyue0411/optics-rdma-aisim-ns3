@@ -554,7 +554,7 @@ namespace ns3 {
 				// std::cout << "id: " << m_node->GetId() << " NIC receive from " << sid << std::endl;
 				if (ch.l3Prot == 0xFC) {
 				}
-				int ret = m_rdmaReceiveCb(packet, ch);
+				int ret = m_rdmaReceiveCb(this, packet, ch);
 				// TODO we may based on the ret do something
 			}
 		}

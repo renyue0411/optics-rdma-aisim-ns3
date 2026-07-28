@@ -15,7 +15,9 @@
 #ifdef NS3_MTP
 #include "ns3/mtp-interface.h"
 #endif
+#include <algorithm>
 #include <iostream>	// debug
+#include <limits>
 
 namespace ns3{
 
@@ -182,7 +184,12 @@ TypeId RdmaHw::GetTypeId (void)
 				"the number of gpus in a server, used for routing",
 				UintegerValue(1),
 				MakeUintegerAccessor(&RdmaHw::m_gpus_per_server),
-				MakeUintegerChecker<uint32_t>())	
+				MakeUintegerChecker<uint32_t>())
+		.AddAttribute("ScaleOutPlaneScheduler",
+				"Scale-out plane scheduler: 0=hash, 1=round-robin, 2=least-QP",
+				UintegerValue(SCALE_OUT_HASH),
+				MakeUintegerAccessor(&RdmaHw::m_scaleOutPlaneScheduler),
+				MakeUintegerChecker<uint32_t>(SCALE_OUT_HASH, SCALE_OUT_LEAST_QP))
 		.AddAttribute("TotalPauseTimes",
 				"The number of pause times to simulate PFC pause due to PCIe",
 				UintegerValue(0),
@@ -198,10 +205,7 @@ TypeId RdmaHw::GetTypeId (void)
 }
 
 RdmaHw::RdmaHw(){
-	m_rnicGateEnabled = false;
-	m_rnicGateRnicId = 0;
-	m_rnicGateEpochStartNs = 0;
-	m_rnicGatePeriodNs = 0;
+	m_scaleOutPlaneScheduler = SCALE_OUT_HASH;
 }
 
 void RdmaHw::enable_nvls() {
@@ -219,6 +223,83 @@ void RdmaHw::add_nvswitch(uint32_t nvswitch_id) {
 void RdmaHw::SetNode(Ptr<Node> node){
 	m_node = node;
 }
+
+uint32_t RdmaHw::EncodeRnicPortId(uint32_t physicalNicId, uint32_t planeId){
+	NS_ASSERT_MSG(physicalNicId <= 0xffff, "physical NIC id exceeds 16-bit topology encoding");
+	NS_ASSERT_MSG(planeId <= 0xffff, "plane id exceeds 16-bit topology encoding");
+	return (physicalNicId << 16) | planeId;
+}
+
+uint64_t RdmaHw::MakeNicPlaneKey(uint32_t physicalNicId, uint32_t planeId){
+	return (static_cast<uint64_t>(physicalNicId) << 32) | planeId;
+}
+
+void RdmaHw::RegisterRnicPort(uint32_t portId, uint32_t nicIdx){
+	// Legacy integer topology ports are interpreted as NIC 0 / plane <portId>.
+	RegisterRnicInterface(portId, 0, portId, nicIdx);
+}
+
+void RdmaHw::RegisterRnicInterface(uint32_t portId,
+	                                uint32_t physicalNicId,
+	                                uint32_t planeId,
+	                                uint32_t nicIdx){
+	NS_ASSERT_MSG(nicIdx < m_nic.size(), "RNIC interface maps to an invalid NIC index");
+	NS_ASSERT_MSG(m_nic[nicIdx].dev != NULL, "RNIC interface must map to a QbbNetDevice");
+
+	auto portIt = m_rnicPortToNicIdx.find(portId);
+	if (portIt != m_rnicPortToNicIdx.end()){
+		NS_ASSERT_MSG(portIt->second == nicIdx, "Duplicate RNIC port id maps to different NIC indices");
+		return;
+	}
+
+	auto nicIt = m_nicIdxToRnicPort.find(nicIdx);
+	NS_ASSERT_MSG(nicIt == m_nicIdxToRnicPort.end(), "A NIC index is already registered as another RNIC interface");
+
+	uint64_t key = MakeNicPlaneKey(physicalNicId, planeId);
+	auto endpointIt = m_nicPlaneToNicIdx.find(key);
+	NS_ASSERT_MSG(endpointIt == m_nicPlaneToNicIdx.end(),
+	              "Duplicate (physical NIC, plane) identity on one endpoint");
+
+	m_rnicPortToNicIdx[portId] = nicIdx;
+	m_nicIdxToRnicPort[nicIdx] = portId;
+	m_nicIdxToRnicIdentity[nicIdx] = RnicInterfaceIdentity(portId, physicalNicId, planeId);
+	m_nicPlaneToNicIdx[key] = nicIdx;
+
+	std::cout << "[RNIC INTERFACE REGISTERED] node=" << m_node->GetId()
+	          << " nic=" << physicalNicId
+	          << " plane=" << planeId
+	          << " rnic_port=" << portId
+	          << " ifindex=" << nicIdx
+	          << std::endl;
+}
+
+bool RdmaHw::GetRnicPortId(uint32_t nicIdx, uint32_t &portId) const{
+	auto it = m_nicIdxToRnicPort.find(nicIdx);
+	if (it == m_nicIdxToRnicPort.end()){
+		return false;
+	}
+	portId = it->second;
+	return true;
+}
+
+bool RdmaHw::GetRnicInterfaceIdentity(uint32_t nicIdx, RnicInterfaceIdentity &identity) const{
+	auto it = m_nicIdxToRnicIdentity.find(nicIdx);
+	if (it == m_nicIdxToRnicIdentity.end()){
+		return false;
+	}
+	identity = it->second;
+	return true;
+}
+
+bool RdmaHw::GetNicIdxForNicPlane(uint32_t physicalNicId, uint32_t planeId, uint32_t &nicIdx) const{
+	auto it = m_nicPlaneToNicIdx.find(MakeNicPlaneKey(physicalNicId, planeId));
+	if (it == m_nicPlaneToNicIdx.end()){
+		return false;
+	}
+	nicIdx = it->second;
+	return true;
+}
+
 void RdmaHw::Setup(QpCompleteCallback cb,SendCompleteCallback send_cb){
 	tx_bytes.resize(m_nic.size());
 	last_tx_bytes.resize(m_nic.size());
@@ -254,113 +335,141 @@ void RdmaHw::SetQpRecoverCallback(QpRecoverCallback cb){
 	m_qpRecoverCallback = cb;
 }
 
-void RdmaHw::EnableRnicGate(uint32_t rnicId, uint64_t epochStartNs, uint64_t periodNs, const std::vector<RnicGateSlotEntry> &slots){
-	m_rnicGateEnabled = true;
-	m_rnicGateRnicId = rnicId;
-	m_rnicGateEpochStartNs = epochStartNs;
-	m_rnicGatePeriodNs = periodNs;
-	m_rnicGateSlots = slots;
-
-	std::cout << "[RNIC GATE INSTALLED] rnic=" << rnicId
-			  << " epochNs=" << epochStartNs
-			  << " periodNs=" << periodNs
-			  << " slots=" << slots.size()
-			  << std::endl;
+void RdmaHw::SetRnicGateCallbacks(RnicGateAllowCallback allowCb,
+                                      RnicGateNextTimeCallback nextTimeCb){
+	m_rnicGateAllowCallback = allowCb;
+	m_rnicGateNextTimeCallback = nextTimeCb;
 }
 
-void RdmaHw::DisableRnicGate(){
-	m_rnicGateEnabled = false;
-	m_rnicGateSlots.clear();
+void RdmaHw::ClearRnicGateCallbacks(){
+	m_rnicGateAllowCallback = RnicGateAllowCallback();
+	m_rnicGateNextTimeCallback = RnicGateNextTimeCallback();
 }
 
 bool RdmaHw::RnicGateAllowsQp(Ptr<RdmaQueuePair> qp) const{
-	if (!m_rnicGateEnabled || m_rnicGatePeriodNs == 0 || qp == 0){
+	if (m_rnicGateAllowCallback.IsNull()){
 		return true;
 	}
-
-	uint32_t dstNodeId = (qp->dip.Get() >> 8) & 0xffff;
-	uint64_t nowNs = static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
-	uint64_t offsetNs = nowNs >= m_rnicGateEpochStartNs ?
-		(nowNs - m_rnicGateEpochStartNs) % m_rnicGatePeriodNs :
-		(m_rnicGatePeriodNs - ((m_rnicGateEpochStartNs - nowNs) % m_rnicGatePeriodNs)) % m_rnicGatePeriodNs;
-
-	for (uint32_t i = 0; i < m_rnicGateSlots.size(); ++i){
-		const RnicGateSlotEntry &slot = m_rnicGateSlots[i];
-		if (offsetNs < slot.startOffsetNs || offsetNs >= slot.endOffsetNs){
-			continue;
-		}
-
-		uint32_t wordIndex = dstNodeId / 64;
-		uint32_t bitIndex = dstNodeId % 64;
-		if (wordIndex >= slot.dstRnicBitmapWords.size()){
-			return false;
-		}
-		return (slot.dstRnicBitmapWords[wordIndex] & (1ULL << bitIndex)) != 0;
-	}
-
-	return false;
+	return m_rnicGateAllowCallback(qp);
 }
 
 Time RdmaHw::GetNextRnicGateTime(Ptr<RdmaQueuePair> qp) const{
-	if (!m_rnicGateEnabled || m_rnicGatePeriodNs == 0 || qp == 0){
+	if (m_rnicGateNextTimeCallback.IsNull()){
 		return Simulator::Now();
 	}
-
-	uint32_t dstNodeId = (qp->dip.Get() >> 8) & 0xffff;
-	uint64_t nowNs = static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
-	uint64_t offsetNs = nowNs >= m_rnicGateEpochStartNs ?
-		(nowNs - m_rnicGateEpochStartNs) % m_rnicGatePeriodNs :
-		(m_rnicGatePeriodNs - ((m_rnicGateEpochStartNs - nowNs) % m_rnicGatePeriodNs)) % m_rnicGatePeriodNs;
-
-	uint64_t bestDeltaNs = UINT64_MAX;
-	for (uint32_t i = 0; i < m_rnicGateSlots.size(); ++i){
-		const RnicGateSlotEntry &slot = m_rnicGateSlots[i];
-		uint32_t wordIndex = dstNodeId / 64;
-		uint32_t bitIndex = dstNodeId % 64;
-		if (wordIndex >= slot.dstRnicBitmapWords.size() ||
-			(slot.dstRnicBitmapWords[wordIndex] & (1ULL << bitIndex)) == 0){
-			continue;
-		}
-
-		uint64_t candidateDeltaNs;
-		if (offsetNs < slot.startOffsetNs){
-			candidateDeltaNs = slot.startOffsetNs - offsetNs;
-		}else if (offsetNs >= slot.startOffsetNs && offsetNs < slot.endOffsetNs){
-			candidateDeltaNs = 0;
-		}else{
-			candidateDeltaNs = m_rnicGatePeriodNs - offsetNs + slot.startOffsetNs;
-		}
-
-		if (candidateDeltaNs < bestDeltaNs){
-			bestDeltaNs = candidateDeltaNs;
-		}
-	}
-
-	if (bestDeltaNs == UINT64_MAX){
-		return Simulator::GetMaximumSimulationTime();
-	}
-	return Simulator::Now() + NanoSeconds(bestDeltaNs);
+	return m_rnicGateNextTimeCallback(qp);
 }
 
-uint32_t ip_to_node_id(Ipv4Address ip) { return (ip.Get() >> 8) & 0xffff; }
-uint32_t RdmaHw::GetNicIdxOfQp(Ptr<RdmaQueuePair> qp){
-	uint32_t src = qp->m_src;
-	uint32_t dst = qp->m_dest;
-	if(src / m_gpus_per_server == dst / m_gpus_per_server || m_rtTable_nxthop_nvswitch.count(qp->dip.Get()) != 0){ // src and dst are in the same server, communicate through nvswitch
-		auto &v = m_rtTable_nxthop_nvswitch[qp->dip.Get()];
-		if (v.size() > 0){
-			return v[qp->GetHash() % v.size()];
-		}else{
-			NS_ASSERT_MSG(false, "We assume at least one NIC is alive");
-		}
-	}else{ // src and dst don't in the same server, communicate through swicth
-		auto &v = m_rtTable[qp->dip.Get()];
-		if (v.size() > 0){
-			return v[qp->GetHash() % v.size()];
-		}else{
-			NS_ASSERT_MSG(false, "We assume at least one NIC is alive");
+uint32_t RdmaHw::GetNicIdxForDevice(Ptr<QbbNetDevice> dev) const{
+	NS_ASSERT_MSG(dev != NULL, "Cannot resolve a null QbbNetDevice");
+	uint32_t ifIndex = dev->GetIfIndex();
+	if (ifIndex < m_nic.size() && m_nic[ifIndex].dev == dev){
+		return ifIndex;
+	}
+	for (uint32_t i = 0; i < m_nic.size(); ++i){
+		if (m_nic[i].dev == dev){
+			return i;
 		}
 	}
+	NS_ASSERT_MSG(false, "Ingress QbbNetDevice is not registered in RdmaHw::m_nic");
+	return 0;
+}
+
+void RdmaHw::BindTxQpToNic(Ptr<RdmaQueuePair> qp, uint32_t nicIdx){
+	RnicInterfaceIdentity identity;
+	if (!GetRnicInterfaceIdentity(nicIdx, identity)){
+		return; // scale-up interface: retain the existing NVSwitch behavior
+	}
+	qp->m_hasBoundRnicPort = true;
+	qp->m_boundRnicPort = identity.rnicPortId;
+	qp->m_boundNicIdx = nicIdx;
+	qp->m_boundPhysicalNicId = identity.physicalNicId;
+	qp->m_boundPlaneId = identity.planeId;
+
+	std::cout << "[QP PLANE BIND] node=" << m_node->GetId()
+	          << " src=" << qp->m_src
+	          << " dst=" << qp->m_dest
+	          << " sport=" << qp->sport
+	          << " nic=" << identity.physicalNicId
+	          << " plane=" << identity.planeId
+	          << " ifindex=" << nicIdx
+	          << std::endl;
+}
+
+void RdmaHw::BindRxQpToIngress(Ptr<RdmaRxQueuePair> qp, uint32_t nicIdx){
+	RnicInterfaceIdentity identity;
+	if (!GetRnicInterfaceIdentity(nicIdx, identity)){
+		return; // scale-up traffic continues to use the NVSwitch routing table
+	}
+	if (qp->m_hasBoundRnicPort){
+		NS_ASSERT_MSG(qp->m_boundNicIdx == nicIdx,
+		              "One RX QP received scale-out data from multiple planes");
+		return;
+	}
+	qp->m_hasBoundRnicPort = true;
+	qp->m_boundRnicPort = identity.rnicPortId;
+	qp->m_boundNicIdx = nicIdx;
+	qp->m_boundPhysicalNicId = identity.physicalNicId;
+	qp->m_boundPlaneId = identity.planeId;
+}
+
+uint32_t RdmaHw::SelectScaleOutNic(Ptr<RdmaQueuePair> qp, const std::vector<int> &candidates){
+	NS_ASSERT_MSG(!candidates.empty(), "Scale-out route has no live candidate interface");
+
+	if (m_scaleOutPlaneScheduler == SCALE_OUT_HASH){
+		return candidates[qp->GetHash() % candidates.size()];
+	}
+
+	if (m_scaleOutPlaneScheduler == SCALE_OUT_ROUND_ROBIN){
+		uint32_t &cursor = m_scaleOutRrCursor[qp->dip.Get()];
+		uint32_t offset = m_node != NULL ? m_node->GetId() : 0;
+		uint32_t selected = candidates[(cursor + offset) % candidates.size()];
+		++cursor;
+		return selected;
+	}
+
+	if (m_scaleOutPlaneScheduler == SCALE_OUT_LEAST_QP){
+		uint32_t selected = candidates[0];
+		uint32_t selectedLoad = m_nic[selected].qpGrp->GetN();
+		for (uint32_t i = 1; i < candidates.size(); ++i){
+			uint32_t candidate = candidates[i];
+			uint32_t load = m_nic[candidate].qpGrp->GetN();
+			if (load < selectedLoad){
+				selected = candidate;
+				selectedLoad = load;
+			}
+		}
+		return selected;
+	}
+
+	NS_ASSERT_MSG(false, "Unknown scale-out plane scheduler");
+	return candidates[0];
+}
+
+uint32_t RdmaHw::GetNicIdxOfQp(Ptr<RdmaQueuePair> qp){
+	if (qp->m_hasBoundRnicPort){
+		NS_ASSERT_MSG(qp->m_boundNicIdx < m_nic.size(), "QP is bound to an invalid RNIC NIC index");
+		NS_ASSERT_MSG(m_nic[qp->m_boundNicIdx].dev != NULL, "QP is bound to an unavailable RNIC port");
+		return qp->m_boundNicIdx;
+	}
+
+	uint32_t src = qp->m_src;
+	uint32_t dst = qp->m_dest;
+	if(src / m_gpus_per_server == dst / m_gpus_per_server || m_rtTable_nxthop_nvswitch.count(qp->dip.Get()) != 0){
+		// Scale-up keeps the original NVSwitch hash behavior.
+		auto &v = m_rtTable_nxthop_nvswitch[qp->dip.Get()];
+		if (!v.empty()){
+			return v[qp->GetHash() % v.size()];
+		}
+		NS_ASSERT_MSG(false, "Scale-up route has no live NIC");
+	}else{
+		// Scale-out uses a pluggable plane scheduler and is then pinned per QP.
+		auto &v = m_rtTable[qp->dip.Get()];
+		uint32_t nicIdx = SelectScaleOutNic(qp, v);
+		BindTxQpToNic(qp, nicIdx);
+		return nicIdx;
+	}
+	return 0;
 }
 uint64_t RdmaHw::GetQpKey(uint32_t dip, uint16_t sport, uint16_t pg){
 	return ((uint64_t)dip << 32) | ((uint64_t)sport << 16) | (uint64_t)pg;
@@ -493,26 +602,29 @@ Ptr<RdmaRxQueuePair> RdmaHw::GetRxQp(uint32_t sip, uint32_t dip, uint16_t sport,
 }
 
 uint32_t RdmaHw::GetNicIdxOfRxQp(Ptr<RdmaRxQueuePair> q){
-	// BUG就出现在这里了，首先要判断m_rtTable[q->dip]是否存在，若不存在就去判断m_rtTable_nxthop_nvswitch是否存在，如果都不存在，那么就输出错误
-	// auto &v = m_rtTable[q->dip];
-
-	if(m_rtTable.count(q->dip) != 0) {
-		auto &v = m_rtTable[q->dip];
-		if(v.size() > 0)
-			return v[q->GetHash() % v.size()];
-		else 
-			NS_ASSERT_MSG(false, "We assume at least one NIC is alive");
-	} else if(m_rtTable_nxthop_nvswitch.count(q->dip) != 0) {
-		auto &v = m_rtTable_nxthop_nvswitch[q->dip];
-		if(v.size() > 0)
-			return v[q->GetHash() % v.size()];
-		else 
-			NS_ASSERT_MSG(false, "We assume at least one NIC is alive");
-	} else {
-		NS_ASSERT_MSG(false, "We assume at least one NIC is alive");
+	if (q->m_hasBoundRnicPort){
+		NS_ASSERT_MSG(q->m_boundNicIdx < m_nic.size(), "RX QP is bound to an invalid RNIC interface");
+		return q->m_boundNicIdx;
 	}
-	NS_ASSERT_MSG(false, "We assume at least one NIC is alive");
-	
+
+	uint32_t remoteNode =
+		(Ipv4Address(q->dip).Get() >> 8) & 0xffff;
+	bool sameServer = (m_node->GetId() / m_gpus_per_server == remoteNode / m_gpus_per_server);
+	if (sameServer || m_rtTable_nxthop_nvswitch.count(q->dip) != 0){
+		auto &v = m_rtTable_nxthop_nvswitch[q->dip];
+		if (!v.empty()){
+			return v[q->GetHash() % v.size()];
+		}
+	}
+
+	auto it = m_rtTable.find(q->dip);
+	if (it != m_rtTable.end() && !it->second.empty()){
+		// Legacy fallback for a flow that was not bound from an ingress plane.
+		return it->second[q->GetHash() % it->second.size()];
+	}
+
+	NS_ASSERT_MSG(false, "RX QP has no reverse route");
+	return 0;
 }
 void RdmaHw::DeleteRxQp(uint32_t dip, uint16_t pg, uint16_t dport){
 	uint64_t key = ((uint64_t)dip << 32) | ((uint64_t)pg << 16) | (uint64_t)dport;
@@ -543,12 +655,13 @@ void RdmaHw::SendComplete(Ptr<RdmaQueuePair> qp)
 	m_sendCompleteCallback(qp);
 }
 
-int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
+int RdmaHw::ReceiveUdp(Ptr<QbbNetDevice> ingressDev, Ptr<Packet> p, CustomHeader &ch){
 	uint8_t ecnbits = ch.GetIpv4EcnBits();
 	
 	uint32_t payload_size = p->GetSize() - ch.GetSerializedSize();
 	// TODO find corresponding rx queue pair
 	Ptr<RdmaRxQueuePair> rxQp = GetRxQp(ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg, true);
+	BindRxQpToIngress(rxQp, GetNicIdxForDevice(ingressDev));
 	if (ecnbits != 0){
 		rxQp->m_ecn_source.ecnbits |= ecnbits;
 		rxQp->m_ecn_source.qfb++;
@@ -702,9 +815,9 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 	return 0;
 }
 
-int RdmaHw::Receive(Ptr<Packet> p, CustomHeader &ch){
+int RdmaHw::Receive(Ptr<QbbNetDevice> ingressDev, Ptr<Packet> p, CustomHeader &ch){
 	if (ch.l3Prot == 0x11){ // UDP
-		ReceiveUdp(p, ch);
+		ReceiveUdp(ingressDev, p, ch);
 	}else if (ch.l3Prot == 0xFF){ // CNP
 		ReceiveCnp(p, ch);
 	}else if (ch.l3Prot == 0xFD){ // NACK

@@ -25,6 +25,11 @@ public:
 	uint16_t m_ipid;
 	uint32_t m_win; // bound of on-the-fly packets
 	uint64_t m_baseRtt; // base RTT of this qp
+	bool m_hasBoundRnicPort; // true after the QP is pinned to one scale-out interface
+	uint32_t m_boundRnicPort; // internally encoded stable RNIC port id
+	uint32_t m_boundNicIdx; // ns-3 QbbNetDevice/interface index
+	uint32_t m_boundPhysicalNicId; // topology NIC id, local to the GPU/NPU node
+	uint32_t m_boundPlaneId; // global scale-out plane id
 	DataRate m_max_rate; // max rate
 	bool m_var_win; // variable window size
 	Time m_nextAvail;	//< Soonest time of next send
@@ -133,6 +138,11 @@ public:
 	Time m_nackTimer;
 	int32_t m_milestone_rx;
 	uint32_t m_lastNACK;
+	bool m_hasBoundRnicPort; // same-plane ACK/NACK affinity is active
+	uint32_t m_boundRnicPort;
+	uint32_t m_boundNicIdx;
+	uint32_t m_boundPhysicalNicId;
+	uint32_t m_boundPlaneId;
 	EventId QcnTimerEvent; // if destroy this rxQp, remember to cancel this timer
 
 	static TypeId GetTypeId (void);
