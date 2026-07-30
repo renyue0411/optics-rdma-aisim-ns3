@@ -186,10 +186,10 @@ TypeId RdmaHw::GetTypeId (void)
 				MakeUintegerAccessor(&RdmaHw::m_gpus_per_server),
 				MakeUintegerChecker<uint32_t>())
 		.AddAttribute("ScaleOutPlaneScheduler",
-				"Scale-out plane scheduler: 0=hash, 1=round-robin, 2=least-QP",
+				"Scale-out plane scheduler: 0=hash, 1=round-robin, 2=least-QP, 3=time-hash",
 				UintegerValue(SCALE_OUT_HASH),
 				MakeUintegerAccessor(&RdmaHw::m_scaleOutPlaneScheduler),
-				MakeUintegerChecker<uint32_t>(SCALE_OUT_HASH, SCALE_OUT_LEAST_QP))
+				MakeUintegerChecker<uint32_t>(SCALE_OUT_HASH, SCALE_OUT_TIME_HASH))
 		.AddAttribute("TotalPauseTimes",
 				"The number of pause times to simulate PFC pause due to PCIe",
 				UintegerValue(0),
@@ -298,6 +298,24 @@ bool RdmaHw::GetNicIdxForNicPlane(uint32_t physicalNicId, uint32_t planeId, uint
 	}
 	nicIdx = it->second;
 	return true;
+}
+
+void RdmaHw::ClearTimeHashReachability(){
+	m_timeHashReachablePorts.clear();
+}
+
+void RdmaHw::AddTimeHashReachability(uint32_t dstNodeId, uint32_t rnicPortId){
+	NS_ASSERT_MSG(m_rnicPortToNicIdx.find(rnicPortId) != m_rnicPortToNicIdx.end(),
+	              "TIME HASH reachability references an unregistered RNIC port");
+	m_timeHashReachablePorts[dstNodeId].insert(rnicPortId);
+}
+
+bool RdmaHw::IsTimeHashReachable(uint32_t dstNodeId, uint32_t rnicPortId) const{
+	auto dstIt = m_timeHashReachablePorts.find(dstNodeId);
+	if (dstIt == m_timeHashReachablePorts.end()){
+		return false;
+	}
+	return dstIt->second.find(rnicPortId) != dstIt->second.end();
 }
 
 void RdmaHw::Setup(QpCompleteCallback cb,SendCompleteCallback send_cb){
@@ -439,6 +457,43 @@ uint32_t RdmaHw::SelectScaleOutNic(Ptr<RdmaQueuePair> qp, const std::vector<int>
 				selectedLoad = load;
 			}
 		}
+		return selected;
+	}
+
+	if (m_scaleOutPlaneScheduler == SCALE_OUT_TIME_HASH){
+		std::vector<int> reachableCandidates;
+		for (uint32_t i = 0; i < candidates.size(); ++i){
+			uint32_t candidate = static_cast<uint32_t>(candidates[i]);
+			uint32_t rnicPortId = 0;
+			NS_ASSERT_MSG(GetRnicPortId(candidate, rnicPortId),
+			              "TIME HASH candidate is not a registered scale-out RNIC interface");
+			if (IsTimeHashReachable(qp->m_dest, rnicPortId)){
+				reachableCandidates.push_back(candidates[i]);
+			}
+		}
+
+		NS_ASSERT_MSG(!reachableCandidates.empty(),
+		              "TIME HASH found no reachable plane for src=" << qp->m_src
+		              << " dst=" << qp->m_dest
+		              << " sport=" << qp->sport
+		              << " candidates=" << candidates.size());
+
+		uint32_t selected =
+			static_cast<uint32_t>(reachableCandidates[qp->GetHash() % reachableCandidates.size()]);
+		RnicInterfaceIdentity identity;
+		NS_ASSERT_MSG(GetRnicInterfaceIdentity(selected, identity),
+		              "TIME HASH selected NIC has no RNIC identity");
+
+		std::cout << "[TIME HASH BIND] node=" << m_node->GetId()
+		          << " src=" << qp->m_src
+		          << " dst=" << qp->m_dest
+		          << " sport=" << qp->sport
+		          << " reachable_candidates=" << reachableCandidates.size()
+		          << " rnic_port=" << identity.rnicPortId
+		          << " nic=" << identity.physicalNicId
+		          << " plane=" << identity.planeId
+		          << " ifindex=" << selected
+		          << std::endl;
 		return selected;
 	}
 

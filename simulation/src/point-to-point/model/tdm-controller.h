@@ -65,6 +65,7 @@ public:
   void CompileRnicReachabilityWindows ();
   void DumpRnicGroups () const;
   void DumpRnicReachabilityWindows () const;
+  void InstallTimeHashReachability () const;
   void InstallRdmaGateTables (uint32_t mode) const;
 
   uint32_t GetRnicGroupForNode (uint32_t nodeId) const;

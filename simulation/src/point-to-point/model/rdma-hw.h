@@ -65,10 +65,14 @@ public:
 	enum ScaleOutPlaneScheduler {
 		SCALE_OUT_HASH = 0,
 		SCALE_OUT_ROUND_ROBIN = 1,
-		SCALE_OUT_LEAST_QP = 2
+		SCALE_OUT_LEAST_QP = 2,
+		SCALE_OUT_TIME_HASH = 3
 	};
 	uint32_t m_scaleOutPlaneScheduler;
 	std::unordered_map<uint32_t, uint32_t> m_scaleOutRrCursor;
+	// dst node -> stable RNIC ports that have at least one injection window
+	// during the complete OCS schedule period. Used only by time hash.
+	std::unordered_map<uint32_t, std::set<uint32_t> > m_timeHashReachablePorts;
 
 	typedef Callback<bool, Ptr<RdmaQueuePair> > RnicGateAllowCallback;
 	typedef Callback<Time, Ptr<RdmaQueuePair> > RnicGateNextTimeCallback;
@@ -115,6 +119,9 @@ public:
 	bool GetRnicPortId(uint32_t nicIdx, uint32_t &portId) const;
 	bool GetRnicInterfaceIdentity(uint32_t nicIdx, RnicInterfaceIdentity &identity) const;
 	bool GetNicIdxForNicPlane(uint32_t physicalNicId, uint32_t planeId, uint32_t &nicIdx) const;
+	void ClearTimeHashReachability();
+	void AddTimeHashReachability(uint32_t dstNodeId, uint32_t rnicPortId);
+	bool IsTimeHashReachable(uint32_t dstNodeId, uint32_t rnicPortId) const;
 	void Setup(QpCompleteCallback cb,SendCompleteCallback send_cb);
 	void SetQpProgressCallback(QpProgressCallback cb);
 	void SetQpRecoverCallback(QpRecoverCallback cb);

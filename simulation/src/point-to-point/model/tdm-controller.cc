@@ -1493,6 +1493,107 @@ TdmController::CompileRnicReachabilityWindows ()
 }
 
 void
+TdmController::InstallTimeHashReachability () const
+{
+  typedef std::map<RnicEndpointKey, std::set<uint32_t> > ReachabilityMap;
+  ReachabilityMap reachableByEndpoint;
+
+  for (uint32_t i = 0; i < m_rnicReachabilityWindows.size (); ++i)
+    {
+      const RnicReachabilityWindow &window = m_rnicReachabilityWindows[i];
+      std::map<uint32_t, RnicGroup>::const_iterator srcIt =
+        m_rnicGroups.find (window.srcGroup);
+      std::map<uint32_t, RnicGroup>::const_iterator dstIt =
+        m_rnicGroups.find (window.dstGroup);
+
+      NS_ASSERT_MSG (srcIt != m_rnicGroups.end (),
+                     "TIME HASH source group is missing");
+      NS_ASSERT_MSG (dstIt != m_rnicGroups.end (),
+                     "TIME HASH destination group is missing");
+
+      const RnicGroup &srcGroup = srcIt->second;
+      const RnicGroup &dstGroup = dstIt->second;
+
+      for (uint32_t sidx = 0; sidx < srcGroup.endpoints.size (); ++sidx)
+        {
+          const RnicEndpoint &src = srcGroup.endpoints[sidx];
+          RnicEndpointKey key = std::make_pair (src.nodeId, src.rnicPortId);
+
+          for (uint32_t didx = 0; didx < dstGroup.endpoints.size (); ++didx)
+            {
+              uint32_t dstNode = dstGroup.endpoints[didx].nodeId;
+              if (dstNode != src.nodeId)
+                {
+                  reachableByEndpoint[key].insert (dstNode);
+                }
+            }
+        }
+    }
+
+  std::set<uint32_t> endpointNodes;
+  for (std::map<RnicEndpointKey, uint32_t>::const_iterator endpointIt =
+         m_endpointToRnicGroup.begin ();
+       endpointIt != m_endpointToRnicGroup.end ();
+       ++endpointIt)
+    {
+      endpointNodes.insert (endpointIt->first.first);
+    }
+
+  for (std::set<uint32_t>::const_iterator nodeIt = endpointNodes.begin ();
+       nodeIt != endpointNodes.end ();
+       ++nodeIt)
+    {
+      uint32_t nodeId = *nodeIt;
+      NS_ASSERT_MSG (nodeId < m_nodes.GetN (),
+                     "TIME HASH endpoint node is out of range");
+      Ptr<RdmaDriver> driver = m_nodes.Get (nodeId)->GetObject<RdmaDriver> ();
+      NS_ASSERT_MSG (driver != 0 && driver->m_rdma != 0,
+                     "TIME HASH endpoint has no RdmaHw");
+      driver->m_rdma->ClearTimeHashReachability ();
+    }
+
+  uint32_t installedEndpointTables = 0;
+  uint64_t installedPairPortMappings = 0;
+
+  for (ReachabilityMap::const_iterator it = reachableByEndpoint.begin ();
+       it != reachableByEndpoint.end ();
+       ++it)
+    {
+      uint32_t nodeId = it->first.first;
+      uint32_t rnicPortId = it->first.second;
+
+      NS_ASSERT_MSG (nodeId < m_nodes.GetN (),
+                     "TIME HASH endpoint node is out of range");
+
+      Ptr<RdmaDriver> driver = m_nodes.Get (nodeId)->GetObject<RdmaDriver> ();
+      NS_ASSERT_MSG (driver != 0 && driver->m_rdma != 0,
+                     "TIME HASH endpoint has no RdmaHw");
+
+      Ptr<RdmaHw> rdmaHw = driver->m_rdma;
+
+      for (std::set<uint32_t>::const_iterator dstIt = it->second.begin ();
+           dstIt != it->second.end ();
+           ++dstIt)
+        {
+          rdmaHw->AddTimeHashReachability (*dstIt, rnicPortId);
+          ++installedPairPortMappings;
+        }
+
+      std::cout << "[TIME HASH REACHABILITY]"
+                << " node=" << nodeId
+                << " rnic_port=" << rnicPortId
+                << " destinations=" << it->second.size ()
+                << std::endl;
+      ++installedEndpointTables;
+    }
+
+  std::cout << "[TIME HASH SUMMARY]"
+            << " endpoint_tables=" << installedEndpointTables
+            << " pair_port_mappings=" << installedPairPortMappings
+            << std::endl;
+}
+
+void
 TdmController::DumpRnicGroups () const
 {
   for (std::map<uint32_t, RnicGroup>::const_iterator it =
