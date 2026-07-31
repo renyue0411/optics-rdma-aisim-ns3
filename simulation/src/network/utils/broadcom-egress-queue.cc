@@ -54,11 +54,20 @@ namespace ns3 {
 
 	BEgressQueue::BEgressQueue() 
 		: PacketQueue(),
+		m_calendarEnabled(false),
+		m_activeCalendarSlot(-1),
 		NS_LOG_TEMPLATE_DEFINE ("BEgressQueue")
 	{
 		NS_LOG_FUNCTION_NOARGS();
 		m_bytesInQueueTotal = 0;
 		m_rrlast = 0;
+		m_qlast = 0;
+		m_nBytes = 0;
+		m_nTotalReceivedBytes = 0;
+		m_nPackets = 0;
+		m_nTotalReceivedPackets = 0;
+		m_nTotalDroppedBytes = 0;
+		m_nTotalDroppedPackets = 0;
 		for (uint32_t i = 0; i < fCnt; i++)
 		{
 			m_bytesInQueue[i] = 0;
@@ -72,10 +81,51 @@ namespace ns3 {
 		NS_LOG_FUNCTION_NOARGS();
 	}
 
+	void
+		BEgressQueue::ConfigureCalendar(uint32_t numSlots)
+	{
+		NS_ASSERT_MSG(m_bytesInQueueTotal == 0,
+		              "Calendar configuration must be installed before packets are queued");
+		m_calendarQueue.Configure(numSlots, qCnt);
+		m_calendarEnabled = true;
+		m_activeCalendarSlot = -1;
+	}
+
+	bool
+		BEgressQueue::IsCalendarEnabled() const
+	{
+		return m_calendarEnabled;
+	}
+
+	uint32_t
+		BEgressQueue::GetCalendarNumSlots() const
+	{
+		return m_calendarQueue.IsConfigured() ? m_calendarQueue.GetNumSlots() : 0;
+	}
+
+	void
+		BEgressQueue::SetActiveCalendarSlot(int32_t slot)
+	{
+		if (slot >= 0)
+		{
+			NS_ASSERT_MSG(m_calendarEnabled, "Cannot activate an unconfigured CalendarQueue");
+			NS_ASSERT_MSG(static_cast<uint32_t>(slot) < m_calendarQueue.GetNumSlots(),
+			              "Calendar slot out of range");
+		}
+		m_activeCalendarSlot = slot;
+	}
+
+	int32_t
+		BEgressQueue::GetActiveCalendarSlot() const
+	{
+		return m_activeCalendarSlot;
+	}
+
 	bool
 		BEgressQueue::DoEnqueue(Ptr<Packet> p, uint32_t qIndex)
 	{
 		NS_LOG_FUNCTION(this << p);
+		NS_ASSERT_MSG(qIndex < fCnt, "BEgressQueue priority out of range");
 
 		if (m_bytesInQueueTotal + p->GetSize() < m_maxBytes)  //infinite queue
 		{
@@ -90,6 +140,86 @@ namespace ns3 {
 		return true;
 	}
 
+	bool
+		BEgressQueue::DoEnqueueCalendar(Ptr<Packet> p, uint32_t qIndex, uint32_t sendSlot)
+	{
+		NS_LOG_FUNCTION(this << p << qIndex << sendSlot);
+		NS_ASSERT_MSG(m_calendarEnabled, "Calendar enqueue on an unconfigured queue");
+		NS_ASSERT_MSG(qIndex < qCnt, "Calendar priority out of range");
+		NS_ASSERT_MSG(sendSlot < m_calendarQueue.GetNumSlots(), "Calendar send slot out of range");
+
+		if (m_bytesInQueueTotal + p->GetSize() < m_maxBytes)
+		{
+			m_calendarQueue.Enqueue(sendSlot, qIndex, p);
+			m_bytesInQueueTotal += p->GetSize();
+			m_bytesInQueue[qIndex] += p->GetSize();
+			return true;
+		}
+		return false;
+	}
+
+	bool
+		BEgressQueue::SelectNextQueue(bool paused[], uint32_t &qIndex, bool &fromCalendar) const
+	{
+		fromCalendar = false;
+
+		// Link-local priority-0 traffic (notably PFC) remains immediately eligible.
+		if (m_queues[0]->GetNPackets() > 0)
+		{
+			qIndex = 0;
+			return true;
+		}
+
+		// Routed priority-0 packets may be time-gated but retain strict priority.
+		if (m_calendarEnabled && m_activeCalendarSlot >= 0 &&
+		    m_calendarQueue.Peek(static_cast<uint32_t>(m_activeCalendarSlot), 0) != 0)
+		{
+			qIndex = 0;
+			fromCalendar = true;
+			return true;
+		}
+
+		// Round-robin across data PGs 1..7.
+		for (uint32_t step = 1; step < qCnt; ++step)
+		{
+			uint32_t candidate = 1 + ((m_rrlast + step - 1) % (qCnt - 1));
+			if (paused[candidate])
+			{
+				continue;
+			}
+
+			if (m_queues[candidate]->GetNPackets() > 0)
+			{
+				qIndex = candidate;
+				return true;
+			}
+
+			if (m_calendarEnabled && m_activeCalendarSlot >= 0 &&
+			    m_calendarQueue.Peek(static_cast<uint32_t>(m_activeCalendarSlot), candidate) != 0)
+			{
+				qIndex = candidate;
+				fromCalendar = true;
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	Ptr<const Packet>
+		BEgressQueue::PeekRR(bool paused[], uint32_t &qIndex, bool &fromCalendar) const
+	{
+		if (!SelectNextQueue(paused, qIndex, fromCalendar))
+		{
+			return 0;
+		}
+		if (fromCalendar)
+		{
+			return m_calendarQueue.Peek(static_cast<uint32_t>(m_activeCalendarSlot), qIndex);
+		}
+		return m_queues[qIndex]->Peek();
+	}
+
 	Ptr<Packet>
 		BEgressQueue::DoDequeueRR(bool paused[]) //this is for switch only
 	{
@@ -100,46 +230,35 @@ namespace ns3 {
 			NS_LOG_LOGIC("Queue empty");
 			return 0;
 		}
-		bool found = false;
-		uint32_t qIndex;
 
-		if (m_queues[0]->GetNPackets() > 0) //0 is the highest priority
+		uint32_t qIndex = 0;
+		bool fromCalendar = false;
+		if (!SelectNextQueue(paused, qIndex, fromCalendar))
 		{
-			found = true;
-			qIndex = 0;
+			NS_LOG_LOGIC("Nothing can be sent");
+			return 0;
+		}
+
+		Ptr<Packet> p;
+		if (fromCalendar)
+		{
+			p = m_calendarQueue.Dequeue(static_cast<uint32_t>(m_activeCalendarSlot), qIndex);
 		}
 		else
 		{
-			if (!found)
-			{
-				for (qIndex = 1; qIndex <= qCnt; qIndex++)
-				{
-					if (!paused[(qIndex + m_rrlast) % qCnt] && m_queues[(qIndex + m_rrlast) % qCnt]->GetNPackets() > 0)  //round robin
-					{
-						found = true;
-						break;
-					}
-				}
-				qIndex = (qIndex + m_rrlast) % qCnt;
-			}
+			p = m_queues[qIndex]->Dequeue();
 		}
-		if (found)
+
+		NS_ASSERT_MSG(p != 0, "Selected BEgressQueue entry disappeared");
+		m_traceBeqDequeue(p, qIndex);
+		m_bytesInQueueTotal -= p->GetSize();
+		m_bytesInQueue[qIndex] -= p->GetSize();
+		if (qIndex != 0)
 		{
-			Ptr<Packet> p = m_queues[qIndex]->Dequeue();
-			m_traceBeqDequeue(p, qIndex);
-			m_bytesInQueueTotal -= p->GetSize();
-			m_bytesInQueue[qIndex] -= p->GetSize();
-			if (qIndex != 0)
-			{
-				m_rrlast = qIndex;
-			}
-			m_qlast = qIndex;
-			NS_LOG_LOGIC("Popped " << p);
-			NS_LOG_LOGIC("Number bytes " << m_bytesInQueueTotal);
-			return p;
+			m_rrlast = qIndex;
 		}
-		NS_LOG_LOGIC("Nothing can be sent");
-		return 0;
+		m_qlast = qIndex;
+		return p;
 	}
 
 	bool
@@ -160,6 +279,24 @@ namespace ns3 {
 			m_nBytes += size;
 			m_nTotalReceivedBytes += size;
 
+			m_nPackets++;
+			m_nTotalReceivedPackets++;
+		}
+		return retval;
+	}
+
+	bool
+		BEgressQueue::EnqueueCalendar(Ptr<Packet> p, uint32_t qIndex, uint32_t sendSlot)
+	{
+		NS_LOG_FUNCTION(this << p << qIndex << sendSlot);
+		bool retval = DoEnqueueCalendar(p, qIndex, sendSlot);
+		if (retval)
+		{
+			m_traceEnqueue(p);
+			m_traceBeqEnqueue(p, qIndex);
+			uint32_t size = p->GetSize();
+			m_nBytes += size;
+			m_nTotalReceivedBytes += size;
 			m_nPackets++;
 			m_nTotalReceivedPackets++;
 		}

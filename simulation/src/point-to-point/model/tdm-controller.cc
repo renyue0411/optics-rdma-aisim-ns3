@@ -20,6 +20,9 @@
 #include "ns3/rdma-driver.h"
 #include "ns3/rdma-hw.h"
 #include "ns3/rdma-transport.h"
+#include "ns3/switch-node.h"
+#include "ns3/qbb-net-device.h"
+#include "ns3/time-flow-table.h"
 
 namespace ns3 {
 
@@ -62,6 +65,31 @@ CalcSerializationNs (uint32_t packetBytes, uint64_t bandwidthBps)
 
   return CeilDivUint64 (static_cast<uint64_t> (packetBytes) * 8ULL * 1000000000ULL,
                         bandwidthBps);
+}
+
+static std::string
+FormatDestinationBitmap (const std::vector<uint64_t> &bitmapWords)
+{
+  std::ostringstream os;
+  bool first = true;
+  for (uint32_t wordIndex = 0; wordIndex < bitmapWords.size (); ++wordIndex)
+    {
+      uint64_t word = bitmapWords[wordIndex];
+      for (uint32_t bitIndex = 0; bitIndex < 64; ++bitIndex)
+        {
+          if ((word & (1ULL << bitIndex)) == 0)
+            {
+              continue;
+            }
+          if (!first)
+            {
+              os << ",";
+            }
+          os << (wordIndex * 64 + bitIndex);
+          first = false;
+        }
+    }
+  return first ? "-" : os.str ();
 }
 
 class SimpleDsu
@@ -164,6 +192,15 @@ TdmController::AddOcsNode (uint32_t nodeId)
   NS_ASSERT_MSG (ocs != 0, "AddOcsNode points to a non-OCS node");
 
   m_ocsNodeIds.insert (nodeId);
+}
+
+void
+TdmController::AddTimeFlowSwitch (uint32_t nodeId)
+{
+  NS_ASSERT_MSG (nodeId < m_nodes.GetN (), "Time-flow switch node id out of range");
+  Ptr<SwitchNode> sw = DynamicCast<SwitchNode> (m_nodes.Get (nodeId));
+  NS_ASSERT_MSG (sw != 0, "AddTimeFlowSwitch points to a non-EPS node");
+  m_timeFlowSwitchIds.insert (nodeId);
 }
 
 void
@@ -1936,6 +1973,23 @@ TdmController::InstallRnicGateTablesToRdmaHw () const
           hwSlots.push_back (hwSlot);
         }
 
+      for (uint32_t k = 0; k < hwSlots.size (); ++k)
+        {
+          std::cout << "[INJECTION WINDOW]"
+                    << " mode=1"
+                    << " layer=rnic"
+                    << " node=" << nodeId
+                    << " rnic_port=" << rnicPortId
+                    << " plane=" << (rnicPortId & 0xffffU)
+                    << " epoch_ns=0"
+                    << " start_ns=" << hwSlots[k].startOffsetNs
+                    << " end_ns=" << hwSlots[k].endOffsetNs
+                    << " period_ns=" << periodNs
+                    << " destinations="
+                    << FormatDestinationBitmap (hwSlots[k].dstRnicBitmapWords)
+                    << std::endl;
+        }
+
       uint64_t loggedExtraGuardNs = tableMaxExtraGuardNs[key];
       uint64_t loggedBottleneckBps = tableMinBottleneckBps[key];
       uint64_t loggedDrainGuardNs =
@@ -2175,6 +2229,23 @@ TdmController::InstallRnicGateTablesToUserspace () const
           hwSlots.push_back (hwSlot);
         }
 
+      for (uint32_t k = 0; k < hwSlots.size (); ++k)
+        {
+          std::cout << "[INJECTION WINDOW]"
+                    << " mode=2"
+                    << " layer=userspace"
+                    << " node=" << nodeId
+                    << " rnic_port=" << rnicPortId
+                    << " plane=" << (rnicPortId & 0xffffU)
+                    << " epoch_ns=0"
+                    << " start_ns=" << hwSlots[k].startOffsetNs
+                    << " end_ns=" << hwSlots[k].endOffsetNs
+                    << " period_ns=" << periodNs
+                    << " destinations="
+                    << FormatDestinationBitmap (hwSlots[k].dstRnicBitmapWords)
+                    << std::endl;
+        }
+
       Ptr<RdmaTransport> transport =
         rdmaDriver->GetTransport ();
       if (transport == 0)
@@ -2215,6 +2286,156 @@ TdmController::InstallRnicGateTablesToUserspace () const
     }
 }
 
+
+
+void
+TdmController::InstallSwitchTimeFlowTables (uint32_t mode)
+{
+  NS_ASSERT_MSG (mode <= 2, "Invalid switch time-flow mode");
+
+  if (m_timeFlowSwitchIds.empty ())
+    {
+      return;
+    }
+
+  if (mode == TimeFlowTable::ROUTE_AND_GATE)
+    {
+      NS_ABORT_MSG ("SWITCH_TIME_FLOW_MODE=2 is reserved but not implemented in this version");
+    }
+
+  uint32_t totalEntries = 0;
+  uint32_t calendarPorts = 0;
+
+  for (std::set<uint32_t>::const_iterator switchIt = m_timeFlowSwitchIds.begin ();
+       switchIt != m_timeFlowSwitchIds.end (); ++switchIt)
+    {
+      uint32_t switchId = *switchIt;
+      Ptr<SwitchNode> sw = DynamicCast<SwitchNode> (m_nodes.Get (switchId));
+      NS_ASSERT_MSG (sw != 0, "Time-flow node is not a SwitchNode");
+      sw->SetTimeFlowCapable (true);
+      sw->SetTimeFlowMode (mode);
+      sw->GetTimeFlowTable ().Clear ();
+
+      if (mode == TimeFlowTable::DISABLED)
+        {
+          continue;
+        }
+
+      const std::unordered_map<uint32_t, std::vector<int> > &routes =
+        sw->GetRoutingTable ();
+      for (std::unordered_map<uint32_t, std::vector<int> >::const_iterator routeIt =
+             routes.begin (); routeIt != routes.end (); ++routeIt)
+        {
+          uint32_t dstIp = routeIt->first;
+          uint32_t dstNodeId = (dstIp >> 8) & 0xffff;
+
+          for (uint32_t nextIndex = 0; nextIndex < routeIt->second.size (); ++nextIndex)
+            {
+              int outIfSigned = routeIt->second[nextIndex];
+              if (outIfSigned < 0)
+                {
+                  continue;
+                }
+              uint32_t outIf = static_cast<uint32_t> (outIfSigned);
+
+              uint32_t switchLogicalPort = 0;
+              PortBinding switchBinding;
+              if (!FindBindingByIfIndex (switchId,
+                                         outIf,
+                                         switchLogicalPort,
+                                         switchBinding))
+                {
+                  continue;
+                }
+
+              uint32_t ocsId = switchBinding.peerNodeId;
+              if (!IsOcsNode (ocsId))
+                {
+                  continue;
+                }
+
+              std::map<uint32_t, OcsScheduleConfig>::const_iterator cfgIt =
+                m_ocsScheduleConfigs.find (ocsId);
+              NS_ASSERT_MSG (cfgIt != m_ocsScheduleConfigs.end (),
+                             "Time-flow EPS port connects to an OCS without a schedule");
+              const OcsScheduleConfig &cfg = cfgIt->second;
+
+              Ptr<QbbNetDevice> dev =
+                DynamicCast<QbbNetDevice> (sw->GetDevice (outIf));
+              NS_ASSERT_MSG (dev != 0, "Time-flow egress is not a QbbNetDevice");
+              bool newlyConfigured = !dev->IsCalendarEnabled ();
+              dev->ConfigureCalendar (MicroSeconds (cfg.epochStartUs),
+                                      MicroSeconds (cfg.sliceDurationUs),
+                                      MicroSeconds (cfg.switchingTimeUs),
+                                      cfg.numSlices,
+                                      NanoSeconds (switchBinding.linkDelayNs));
+              if (newlyConfigured)
+                {
+                  calendarPorts++;
+                }
+
+              // The switch-side binding points to the OCS ingress logical port.
+              uint32_t inputOcsLogicalPort = switchBinding.peerLogicalPort;
+
+              for (uint32_t arrivalSlot = 0;
+                   arrivalSlot < cfg.numSlices;
+                   ++arrivalSlot)
+                {
+                  bool found = false;
+                  uint32_t sendSlot = 0;
+
+                  for (uint32_t wait = 0; wait < cfg.numSlices; ++wait)
+                    {
+                      uint32_t candidateSlot = (arrivalSlot + wait) % cfg.numSlices;
+                      uint32_t outputOcsLogicalPort = 0;
+                      if (!FindScheduledPeerLogicalPort (ocsId,
+                                                         inputOcsLogicalPort,
+                                                         candidateSlot,
+                                                         outputOcsLogicalPort))
+                        {
+                          continue;
+                        }
+
+                      std::map<uint32_t, std::map<uint32_t, PortBinding> >::const_iterator
+                        ocsBindingNode = m_portBindings.find (ocsId);
+                      NS_ASSERT_MSG (ocsBindingNode != m_portBindings.end (),
+                                     "OCS port bindings are missing");
+                      std::map<uint32_t, PortBinding>::const_iterator remotePort =
+                        ocsBindingNode->second.find (outputOcsLogicalPort);
+                      NS_ASSERT_MSG (remotePort != ocsBindingNode->second.end (),
+                                     "Scheduled OCS output logical port is not bound");
+
+                      uint32_t remotePeerNode = remotePort->second.peerNodeId;
+                      if (IsReachableWithoutOcs (remotePeerNode,
+                                                dstNodeId,
+                                                ocsId))
+                        {
+                          found = true;
+                          sendSlot = candidateSlot;
+                          break;
+                        }
+                    }
+
+                  if (found)
+                    {
+                      sw->GetTimeFlowTable ().AddGateEntry (dstIp,
+                                                           outIf,
+                                                           arrivalSlot,
+                                                           sendSlot);
+                      totalEntries++;
+                    }
+                }
+            }
+        }
+    }
+
+  std::cout << "[SWITCH TIME FLOW INSTALLED]"
+            << " mode=" << mode
+            << " capable_eps=" << m_timeFlowSwitchIds.size ()
+            << " calendar_ports=" << calendarPorts
+            << " entries=" << totalEntries
+            << std::endl;
+}
 
 
 void
@@ -2271,6 +2492,117 @@ TdmController::InstallPair (uint32_t ocsId,
   entry.actualIfA = actualIfA;
   entry.actualIfB = actualIfB;
   m_ocsScheduleEntries.push_back (entry);
+}
+
+bool
+TdmController::FindBindingByIfIndex (uint32_t nodeId,
+                                     uint32_t ifIndex,
+                                     uint32_t &logicalPort,
+                                     PortBinding &binding) const
+{
+  std::map<uint32_t, std::map<uint32_t, PortBinding> >::const_iterator nodeIt =
+    m_portBindings.find (nodeId);
+  if (nodeIt == m_portBindings.end ())
+    {
+      return false;
+    }
+
+  for (std::map<uint32_t, PortBinding>::const_iterator it = nodeIt->second.begin ();
+       it != nodeIt->second.end (); ++it)
+    {
+      if (it->second.ifIndex == ifIndex)
+        {
+          logicalPort = it->first;
+          binding = it->second;
+          return true;
+        }
+    }
+  return false;
+}
+
+bool
+TdmController::FindScheduledPeerLogicalPort (uint32_t ocsId,
+                                             uint32_t inputLogicalPort,
+                                             uint32_t slice,
+                                             uint32_t &outputLogicalPort) const
+{
+  for (uint32_t i = 0; i < m_ocsScheduleEntries.size (); ++i)
+    {
+      const OcsScheduleEntry &entry = m_ocsScheduleEntries[i];
+      if (entry.ocsId != ocsId || entry.slice != slice)
+        {
+          continue;
+        }
+      if (entry.logicalPortA == inputLogicalPort)
+        {
+          outputLogicalPort = entry.logicalPortB;
+          return true;
+        }
+      if (entry.logicalPortB == inputLogicalPort)
+        {
+          outputLogicalPort = entry.logicalPortA;
+          return true;
+        }
+    }
+  return false;
+}
+
+bool
+TdmController::IsReachableWithoutOcs (uint32_t startNodeId,
+                                      uint32_t dstNodeId,
+                                      uint32_t excludedOcsId) const
+{
+  if (startNodeId == dstNodeId)
+    {
+      return true;
+    }
+  if (startNodeId >= m_nodes.GetN () || dstNodeId >= m_nodes.GetN ())
+    {
+      return false;
+    }
+  if (IsOcsNode (startNodeId) || IsOcsNode (dstNodeId))
+    {
+      return false;
+    }
+
+  std::queue<uint32_t> pending;
+  std::set<uint32_t> visited;
+  pending.push (startNodeId);
+  visited.insert (startNodeId);
+
+  while (!pending.empty ())
+    {
+      uint32_t current = pending.front ();
+      pending.pop ();
+
+      std::map<uint32_t, std::map<uint32_t, PortBinding> >::const_iterator nodeIt =
+        m_portBindings.find (current);
+      if (nodeIt == m_portBindings.end ())
+        {
+          continue;
+        }
+
+      for (std::map<uint32_t, PortBinding>::const_iterator portIt =
+             nodeIt->second.begin (); portIt != nodeIt->second.end (); ++portIt)
+        {
+          uint32_t peer = portIt->second.peerNodeId;
+          if (current == excludedOcsId || peer == excludedOcsId ||
+              IsOcsNode (current) || IsOcsNode (peer))
+            {
+              continue;
+            }
+          if (peer == dstNodeId)
+            {
+              return true;
+            }
+          if (visited.insert (peer).second)
+            {
+              pending.push (peer);
+            }
+        }
+    }
+
+  return false;
 }
 
 void

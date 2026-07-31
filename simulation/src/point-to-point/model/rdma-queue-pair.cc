@@ -33,6 +33,11 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_dest = -1;
 	m_tag = -1;
 	snd_nxt = snd_una = 0;
+	m_highestSentSeq = 0;
+	m_retransPackets = 0;
+	m_retransBytes = 0;
+	m_nackCount = 0;
+	m_timeoutCount = 0;
 	m_pg = pg;
 	m_ipid = 0;
 	m_win = 0;

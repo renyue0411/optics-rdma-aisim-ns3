@@ -6,6 +6,7 @@
 #include "ns3/boolean.h"
 #include "ns3/uinteger.h"
 #include "ns3/double.h"
+#include "ns3/abort.h"
 #include "switch-node.h"
 #include "qbb-net-device.h"
 #include "ppp-header.h"
@@ -46,6 +47,8 @@ TypeId SwitchNode::GetTypeId (void)
 
 SwitchNode::SwitchNode(){
 	m_ecmpSeed = m_id;
+	m_timeFlowCapable = false;
+	m_timeFlowTable.SetMode(TimeFlowTable::DISABLED);
 	m_node_type = 1;
 	m_mmu = CreateObject<SwitchMmu>();
 	for (uint32_t i = 0; i < pCnt; i++)
@@ -106,36 +109,80 @@ void SwitchNode::CheckAndSendResume(uint32_t inDev, uint32_t qIndex){
 
 void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 	int idx = GetOutDev(p, ch);
-	if (idx >= 0){
-		NS_ASSERT_MSG(m_devices[idx]->IsLinkUp(), "The routing table look up should return link that is up");
-
-		// determine the qIndex
-		uint32_t qIndex;
-		if (ch.l3Prot == 0xFF || ch.l3Prot == 0xFE || (m_ackHighPrio && (ch.l3Prot == 0xFD || ch.l3Prot == 0xFC))){  //QCN or PFC or NACK, go highest priority
-			qIndex = 0;
-		}else{
-			qIndex = (ch.l3Prot == 0x06 ? 1 : ch.udp.pg); // if TCP, put to queue 1
-		}
-		// std::cout << "qIndex is: " << qIndex << std::endl;
-
-		// admission control
-		FlowIdTag t;
-		p->PeekPacketTag(t);
-		uint32_t inDev = t.GetFlowId();
-		if (qIndex != 0){ //not highest priority
-			if (m_mmu->CheckIngressAdmission(inDev, qIndex, p->GetSize()) && m_mmu->CheckEgressAdmission(idx, qIndex, p->GetSize())){			// Admission control
-				m_mmu->UpdateIngressAdmission(inDev, qIndex, p->GetSize());
-				m_mmu->UpdateEgressAdmission(idx, qIndex, p->GetSize());
-			}else{
-				return; // Drop
-			}
-			CheckAndSendPfc(inDev, qIndex);
-		}
-		m_bytes[inDev][idx][qIndex] += p->GetSize();
-		m_devices[idx]->SwitchSend(qIndex, p, ch);
-	}else
-	{
+	if (idx < 0){
 		return; // Drop
+	}
+
+	NS_ASSERT_MSG(m_devices[idx]->IsLinkUp(), "The routing table look up should return link that is up");
+
+	// determine the qIndex
+	uint32_t qIndex;
+	if (ch.l3Prot == 0xFF || ch.l3Prot == 0xFE || (m_ackHighPrio && (ch.l3Prot == 0xFD || ch.l3Prot == 0xFC))){
+		qIndex = 0;
+	}else{
+		qIndex = (ch.l3Prot == 0x06 ? 1 : ch.udp.pg);
+	}
+
+	bool useCalendar = false;
+	uint32_t sendSlot = 0;
+	Ptr<QbbNetDevice> outDev = DynamicCast<QbbNetDevice>(m_devices[idx]);
+
+	// PFC is link-local and is sent directly by QbbNetDevice. Every routed
+	// packet, including CNP/ACK/NACK in priority 0, obeys the calendar when
+	// the existing forwarding logic selects a time-controlled OCS egress.
+	if (m_timeFlowCapable && ch.l3Prot != 0xFE){
+		TimeFlowTable::Mode mode = m_timeFlowTable.GetMode();
+		if (mode == TimeFlowTable::FORWARD_THEN_GATE &&
+		    outDev != 0 && outDev->IsCalendarEnabled())
+		{
+			uint32_t arrivalSlot = outDev->GetCalendarLookupSlot(p->GetSize());
+			if (!m_timeFlowTable.LookupGate(ch.dip,
+			                                static_cast<uint32_t>(idx),
+			                                arrivalSlot,
+			                                sendSlot))
+			{
+				NS_LOG_UNCOND("[SWITCH TIME FLOW MISS] node=" << GetId()
+				              << " dst_ip=" << ch.dip
+				              << " out_if=" << idx
+				              << " arrival_slot=" << arrivalSlot);
+				return;
+			}
+			useCalendar = true;
+		}
+		else if (mode == TimeFlowTable::ROUTE_AND_GATE)
+		{
+			NS_ABORT_MSG("SWITCH_TIME_FLOW_MODE=2 is reserved but not implemented in this version");
+		}
+	}
+
+	// Admission accounting happens before the calendar enqueue and is released
+	// only by SwitchNotifyDequeue(), so calendar backlog remains visible to MMU,
+	// PFC, ECN and queue telemetry.
+	FlowIdTag t;
+	p->PeekPacketTag(t);
+	uint32_t inDev = t.GetFlowId();
+	if (qIndex != 0){
+		if (m_mmu->CheckIngressAdmission(inDev, qIndex, p->GetSize()) &&
+		    m_mmu->CheckEgressAdmission(idx, qIndex, p->GetSize())){
+			m_mmu->UpdateIngressAdmission(inDev, qIndex, p->GetSize());
+			m_mmu->UpdateEgressAdmission(idx, qIndex, p->GetSize());
+		}else{
+			return; // Drop
+		}
+		CheckAndSendPfc(inDev, qIndex);
+	}
+
+	m_bytes[inDev][idx][qIndex] += p->GetSize();
+	bool queued = useCalendar
+		? outDev->SwitchSend(qIndex, p, ch, sendSlot)
+		: m_devices[idx]->SwitchSend(qIndex, p, ch);
+
+	if (!queued){
+		m_bytes[inDev][idx][qIndex] -= p->GetSize();
+		if (qIndex != 0){
+			m_mmu->RemoveFromIngressAdmission(inDev, qIndex, p->GetSize());
+			m_mmu->RemoveFromEgressAdmission(idx, qIndex, p->GetSize());
+		}
 	}
 }
 
@@ -188,6 +235,59 @@ void SwitchNode::AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx){
 
 void SwitchNode::ClearTable(){
 	m_rtTable.clear();
+}
+
+const std::unordered_map<uint32_t, std::vector<int> >&
+SwitchNode::GetRoutingTable() const
+{
+	return m_rtTable;
+}
+
+void
+SwitchNode::SetTimeFlowCapable(bool capable)
+{
+	m_timeFlowCapable = capable;
+	if (!capable)
+	{
+		m_timeFlowTable.Clear();
+		m_timeFlowTable.SetMode(TimeFlowTable::DISABLED);
+	}
+}
+
+bool
+SwitchNode::IsTimeFlowCapable() const
+{
+	return m_timeFlowCapable;
+}
+
+void
+SwitchNode::SetTimeFlowMode(uint32_t mode)
+{
+	NS_ASSERT_MSG(mode <= 2, "Invalid switch time-flow mode");
+	if (!m_timeFlowCapable && mode != 0)
+	{
+		m_timeFlowTable.SetMode(TimeFlowTable::DISABLED);
+		return;
+	}
+	m_timeFlowTable.SetMode(static_cast<TimeFlowTable::Mode>(mode));
+}
+
+TimeFlowTable::Mode
+SwitchNode::GetTimeFlowMode() const
+{
+	return m_timeFlowTable.GetMode();
+}
+
+TimeFlowTable&
+SwitchNode::GetTimeFlowTable()
+{
+	return m_timeFlowTable;
+}
+
+const TimeFlowTable&
+SwitchNode::GetTimeFlowTable() const
+{
+	return m_timeFlowTable;
 }
 
 // This function can only be called in switch mode

@@ -6,6 +6,7 @@
 #include "qbb-net-device.h"
 #include "switch-mmu.h"
 #include "pint.h"
+#include "time-flow-table.h"
 
 namespace ns3 {
 
@@ -17,6 +18,8 @@ class SwitchNode : public Node{
 	uint32_t m_ecmpSeed;
 	std::unordered_map<uint32_t, std::vector<int> > m_rtTable; // map from ip address (u32) to possible ECMP port (index of dev)
 	std::set<uint32_t> active_ports;	// record active ports in switch
+	bool m_timeFlowCapable;
+	TimeFlowTable m_timeFlowTable;
 
 	// monitor of PFC
 	uint32_t m_bytes[pCnt][pCnt][qCnt]; // m_bytes[inDev][outDev][qidx] is the bytes from inDev enqueued for outDev at qidx
@@ -48,6 +51,13 @@ public:
 	void SetEcmpSeed(uint32_t seed);
 	void AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx);
 	void ClearTable();
+	const std::unordered_map<uint32_t, std::vector<int> >& GetRoutingTable() const;
+	void SetTimeFlowCapable(bool capable);
+	bool IsTimeFlowCapable() const;
+	void SetTimeFlowMode(uint32_t mode);
+	TimeFlowTable::Mode GetTimeFlowMode() const;
+	TimeFlowTable& GetTimeFlowTable();
+	const TimeFlowTable& GetTimeFlowTable() const;
 	bool SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> packet, CustomHeader &ch);
 	void SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p);
 

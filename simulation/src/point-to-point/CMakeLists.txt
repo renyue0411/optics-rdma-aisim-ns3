@@ -39,6 +39,7 @@ build_lib(
     model/nvswitch-node.cc
     model/ocs-node.cc
     model/tdm-controller.cc
+    model/time-flow-table.cc
     model/rdma-transport.cc
     model/point-to-point-remote-channel.cc
   HEADER_FILES
@@ -65,6 +66,7 @@ build_lib(
     model/nvswitch-node.h
     model/ocs-node.h
     model/tdm-controller.h
+    model/time-flow-table.h
     model/rdma-transport.h
     model/point-to-point-remote-channel.h
   LIBRARIES_TO_LINK ${libnetwork}

@@ -7,6 +7,7 @@
 #include <ns3/custom-header.h>
 #include "qbb-net-device.h"
 #include <unordered_map>
+#include <map>
 #include <set>
 #include "pint.h"
 
@@ -98,6 +99,29 @@ public:
 	std::vector<uint64_t> last_tx_bytes; // last sampling value <port_id, tx_bytes>
 	std::unordered_map<uint64_t, uint32_t> last_qp_cnp; // last sampling value key of qp ---> received cnp number
 	std::unordered_map<uint64_t, uint64_t> last_qp_rate; // last sampling value key of qp ---> sending rate
+
+	// Per-flow receive-goodput trace. The trace is always enabled and is
+	// emitted as fixed-size time buckets directly to simulator.log.
+	struct FlowRxTraceKey {
+		uint64_t bucketStartNs;
+		uint32_t src;
+		uint32_t dst;
+		uint16_t sport;
+		uint16_t dport;
+		uint16_t pg;
+
+		bool operator< (const FlowRxTraceKey &other) const;
+	};
+	static const uint64_t FLOW_RX_BUCKET_NS = 100000;
+	static std::map<FlowRxTraceKey, uint64_t> m_flowRxBytes;
+	static std::set<FlowRxTraceKey> m_flowRxScheduled;
+	static void RecordFlowRxBytes(uint32_t src,
+	                              uint32_t dst,
+	                              uint16_t sport,
+	                              uint16_t dport,
+	                              uint16_t pg,
+	                              uint32_t bytes);
+	static void FlushFlowRxBucket(FlowRxTraceKey key);
 	void UpdateTxBytes(uint32_t port_id, uint64_t bytes);
 	void PrintHostBW(FILE* bw_output, uint32_t bw_mon_interval);
 	void PrintQPRate(FILE* rate_output);

@@ -256,6 +256,12 @@ namespace ns3 {
 	}
 
 	QbbNetDevice::QbbNetDevice()
+	  : m_calendarEnabled(false),
+	    m_calendarEpochStart(Seconds(0)),
+	    m_calendarSliceDuration(Seconds(0)),
+	    m_calendarSwitchingTime(Seconds(0)),
+	    m_calendarIngressLinkDelay(Seconds(0)),
+	    m_calendarNumSlots(0)
 	{
 		NS_LOG_FUNCTION(this);
 		m_ecn_source = new std::vector<ECNAccount>;
@@ -278,6 +284,10 @@ namespace ns3 {
 
 		// std::cout << "Do QbbNetDevice::DoDispose() function " << std::endl;
 
+		if (!m_calendarEvent.IsExpired())
+		{
+			Simulator::Cancel(m_calendarEvent);
+		}
 		PointToPointNetDevice::DoDispose();
 	}
 
@@ -358,48 +368,8 @@ namespace ns3 {
 				}
 			}
 			return;
-		}else{   //switch, doesn't care about qcn, just send
-			p = m_queue->DequeueRR(m_paused);		//this is round-robin
-			if (p != 0){
-				m_snifferTrace(p);
-				m_promiscSnifferTrace(p);
-				Ipv4Header h;
-				Ptr<Packet> packet = p->Copy();
-				uint16_t protocol = 0;
-				ProcessHeader(packet, protocol);
-				packet->RemoveHeader(h);
-				FlowIdTag t;
-				uint32_t qIndex = m_queue->GetLastQueue();
-				if (qIndex == 0){//this is a pause or cnp, send it immediately!
-					m_node->SwitchNotifyDequeue(m_ifIndex, qIndex, p);
-					p->RemovePacketTag(t);
-				}else{
-					m_node->SwitchNotifyDequeue(m_ifIndex, qIndex, p);
-					p->RemovePacketTag(t);
-				}
-				m_traceDequeue(p, qIndex);
-				TransmitStart(p);
-				return;
-			}else{ //No queue can deliver any packet
-				NS_LOG_INFO("PAUSE prohibits send at node " << m_node->GetId());
-				if (m_node->GetNodeType() == 0 && m_qcnEnabled){ //nothing to send, possibly due to qcn flow control, if so reschedule sending
-					Time t = Simulator::GetMaximumSimulationTime();
-			Time now = Simulator::Now();
-			for (uint32_t i = 0; i < m_rdmaEQ->GetFlowCount(); i++){
-				Ptr<RdmaQueuePair> qp = m_rdmaEQ->GetQp(i);
-				if (qp->m_nextAvail > now){
-					t = Min(qp->m_nextAvail, t);
-				}
-			}
-			Time gateWake = m_rdmaEQ->GetNextGateWake();
-			if (gateWake > now){
-				t = Min(gateWake, t);
-			}
-			if (m_nextSend.IsExpired() && t < Simulator::GetMaximumSimulationTime() && t > now){
-				m_nextSend = Simulator::Schedule(t - now, &QbbNetDevice::DequeueAndTransmit, this);
-			}
-				}
-			}
+		}else{   //switch data plane
+			SwitchDequeueAndTransmit();
 		}
 		return;
 	}
@@ -452,46 +422,202 @@ namespace ns3 {
 		return;
 	}
 
-	void QbbNetDevice::SwitchDequeueAndTransmit(void) {
-		NS_LOG_FUNCTION(this);
-		// if(m_node->GetId() == 0) std::cout << "QP start send at tick: " << Simulator::Now().GetNanoSeconds() << std::endl;
-		if (!m_linkUp) return; // if link is down, return
-		if (m_txMachineState == BUSY) return;	// Quit if channel busy
-		Ptr<Packet> p;
-		p = m_queue->DequeueRR(m_paused);		//this is round-robin
-		if (p != 0){
-			m_snifferTrace(p);
-			m_promiscSnifferTrace(p);
-			Ipv4Header h;
-			Ptr<Packet> packet = p->Copy();
-			uint16_t protocol = 0;
-			ProcessHeader(packet, protocol);
-			packet->RemoveHeader(h);
-			FlowIdTag t;
-			uint32_t qIndex = m_queue->GetLastQueue();
-			if (qIndex == 0){//this is a pause or cnp, send it immediately!
-				m_node->SwitchNotifyDequeue(m_ifIndex, qIndex, p);
-				p->RemovePacketTag(t);
-			}else{
-				m_node->SwitchNotifyDequeue(m_ifIndex, qIndex, p);
-				p->RemovePacketTag(t);
-			}
-			m_traceDequeue(p, qIndex);
-			TransmitStart(p);
+	void
+	QbbNetDevice::ConfigureCalendar(Time epochStart,
+	                                Time sliceDuration,
+	                                Time switchingTime,
+	                                uint32_t numSlots,
+	                                Time ingressLinkDelay)
+	{
+		NS_ASSERT_MSG(m_queue != 0, "QbbNetDevice queue must exist before calendar configuration");
+		NS_ASSERT_MSG(numSlots > 0, "Calendar requires at least one slot");
+		NS_ASSERT_MSG(sliceDuration.GetTimeStep() > 0, "Calendar slice duration must be positive");
+		NS_ASSERT_MSG(switchingTime < sliceDuration,
+		              "Calendar switching time must be smaller than slice duration");
+
+		if (m_calendarEnabled)
+		{
+			NS_ASSERT_MSG(m_calendarEpochStart == epochStart &&
+			              m_calendarSliceDuration == sliceDuration &&
+			              m_calendarSwitchingTime == switchingTime &&
+			              m_calendarIngressLinkDelay == ingressLinkDelay &&
+			              m_calendarNumSlots == numSlots,
+			              "Conflicting calendar configuration on one egress port");
 			return;
-		}else{ //No queue can deliver any packet
-			NS_LOG_INFO("PAUSE prohibits send at node " << m_node->GetId());
-			if (m_node->GetNodeType() == 0 && m_qcnEnabled){ //nothing to send, possibly due to qcn flow control, if so reschedule sending
-				Time t = Simulator::GetMaximumSimulationTime();
-				for (uint32_t i = 0; i < m_rdmaEQ->GetFlowCount(); i++){
-					Ptr<RdmaQueuePair> qp = m_rdmaEQ->GetQp(i);
-					t = Min(qp->m_nextAvail, t);
-				}
-				if (m_nextSend.IsExpired() && t < Simulator::GetMaximumSimulationTime() && t > Simulator::Now()){
-					m_nextSend = Simulator::Schedule(t - Simulator::Now(), &QbbNetDevice::DequeueAndTransmit, this);
-				}
+		}
+
+		m_calendarEnabled = true;
+		m_calendarEpochStart = epochStart;
+		m_calendarSliceDuration = sliceDuration;
+		m_calendarSwitchingTime = switchingTime;
+		m_calendarIngressLinkDelay = ingressLinkDelay;
+		m_calendarNumSlots = numSlots;
+		m_queue->ConfigureCalendar(numSlots);
+		RefreshCalendarState(false);
+	}
+
+	bool
+	QbbNetDevice::IsCalendarEnabled() const
+	{
+		return m_calendarEnabled;
+	}
+
+	uint32_t
+	QbbNetDevice::GetCalendarLookupSlot(uint32_t packetBytes) const
+	{
+		NS_ASSERT_MSG(m_calendarEnabled, "Calendar lookup requested on an unconfigured port");
+		NS_ASSERT_MSG(m_calendarNumSlots > 0, "Calendar has no slots");
+
+		Time now = Simulator::Now();
+		if (now < m_calendarEpochStart)
+		{
+			return 0;
+		}
+
+		uint64_t sliceTicks = m_calendarSliceDuration.GetTimeStep();
+		uint64_t elapsed = (now - m_calendarEpochStart).GetTimeStep();
+		uint64_t offset = elapsed % sliceTicks;
+		uint32_t slot = static_cast<uint32_t>((elapsed / sliceTicks) % m_calendarNumSlots);
+		uint64_t activeTicks = sliceTicks - m_calendarSwitchingTime.GetTimeStep();
+		Time required = m_bps.CalculateBytesTxTime(packetBytes) +
+		                m_calendarIngressLinkDelay + TimeStep(1);
+		NS_ASSERT_MSG(required.GetTimeStep() <= activeTicks,
+		              "A packet cannot reach the OCS inside one active calendar window");
+
+		if (offset < activeTicks &&
+		    required.GetTimeStep() <= activeTicks - offset)
+		{
+			return slot;
+		}
+
+		return (slot + 1) % m_calendarNumSlots;
+	}
+
+	void
+	QbbNetDevice::RefreshCalendarState(bool triggerTransmit)
+	{
+		if (!m_calendarEnabled)
+		{
+			return;
+		}
+
+		if (!m_calendarEvent.IsExpired())
+		{
+			Simulator::Cancel(m_calendarEvent);
+		}
+
+		Time now = Simulator::Now();
+		int32_t activeSlot = -1;
+		Time nextBoundary;
+
+		if (now < m_calendarEpochStart)
+		{
+			nextBoundary = m_calendarEpochStart;
+		}
+		else
+		{
+			uint64_t sliceTicks = m_calendarSliceDuration.GetTimeStep();
+			uint64_t elapsed = (now - m_calendarEpochStart).GetTimeStep();
+			uint64_t offset = elapsed % sliceTicks;
+			uint32_t slot = static_cast<uint32_t>((elapsed / sliceTicks) % m_calendarNumSlots);
+			uint64_t activeTicks = sliceTicks - m_calendarSwitchingTime.GetTimeStep();
+
+			if (offset < activeTicks)
+			{
+				activeSlot = static_cast<int32_t>(slot);
+				nextBoundary = now + TimeStep(activeTicks - offset);
+			}
+			else
+			{
+				nextBoundary = now + TimeStep(sliceTicks - offset);
 			}
 		}
+
+		int32_t oldSlot = m_queue->GetActiveCalendarSlot();
+		m_queue->SetActiveCalendarSlot(activeSlot);
+
+		if (nextBoundary > now)
+		{
+			m_calendarEvent = Simulator::Schedule(nextBoundary - now,
+			                                      &QbbNetDevice::HandleCalendarBoundary,
+			                                      this);
+		}
+
+		if (triggerTransmit && activeSlot >= 0 && activeSlot != oldSlot)
+		{
+			SwitchDequeueAndTransmit();
+		}
+	}
+
+	void
+	QbbNetDevice::HandleCalendarBoundary()
+	{
+		RefreshCalendarState(true);
+	}
+
+	bool
+	QbbNetDevice::CalendarPacketFits(Ptr<const Packet> packet) const
+	{
+		if (!m_calendarEnabled || m_queue->GetActiveCalendarSlot() < 0)
+		{
+			return false;
+		}
+
+		Time now = Simulator::Now();
+		if (now < m_calendarEpochStart)
+		{
+			return false;
+		}
+
+		uint64_t sliceTicks = m_calendarSliceDuration.GetTimeStep();
+		uint64_t elapsed = (now - m_calendarEpochStart).GetTimeStep();
+		uint64_t offset = elapsed % sliceTicks;
+		uint64_t activeTicks = sliceTicks - m_calendarSwitchingTime.GetTimeStep();
+		if (offset >= activeTicks)
+		{
+			return false;
+		}
+
+		Time required = m_bps.CalculateBytesTxTime(packet->GetSize()) +
+		                m_calendarIngressLinkDelay + TimeStep(1);
+		return required.GetTimeStep() <= activeTicks - offset;
+	}
+
+	void QbbNetDevice::SwitchDequeueAndTransmit(void) {
+		NS_LOG_FUNCTION(this);
+		if (!m_linkUp) return;
+		if (m_txMachineState == BUSY) return;
+
+		if (m_calendarEnabled)
+		{
+			RefreshCalendarState(false);
+		}
+
+		uint32_t peekQ = 0;
+		bool fromCalendar = false;
+		Ptr<const Packet> next = m_queue->PeekRR(m_paused, peekQ, fromCalendar);
+		if (next == 0)
+		{
+			NS_LOG_INFO("PAUSE/time gate prohibits send at node " << m_node->GetId());
+			return;
+		}
+
+		if (fromCalendar && !CalendarPacketFits(next))
+		{
+			return;
+		}
+
+		Ptr<Packet> p = m_queue->DequeueRR(m_paused);
+		NS_ASSERT_MSG(p != 0, "Peeked switch packet could not be dequeued");
+		m_snifferTrace(p);
+		m_promiscSnifferTrace(p);
+
+		FlowIdTag t;
+		uint32_t qIndex = m_queue->GetLastQueue();
+		m_node->SwitchNotifyDequeue(m_ifIndex, qIndex, p);
+		p->RemovePacketTag(t);
+		m_traceDequeue(p, qIndex);
+		TransmitStart(p);
 	}
 
 	void
@@ -502,6 +628,11 @@ namespace ns3 {
 		m_paused[qIndex] = false;
 		NS_LOG_INFO("Node " << m_node->GetId() << " dev " << m_ifIndex << " queue " << qIndex <<
 			" resumed at " << Simulator::Now().GetSeconds());
+		if (m_node->GetNodeType() == 1)
+		{
+			SwitchDequeueAndTransmit();
+			return;
+		}
 		Ptr<RdmaQueuePair> lastQp = m_rdmaEQ->GetQp(qIndex);
 		if(lastQp->nvls_enable == 1 && m_node->GetNodeType() == 2) SwitchAsHostSend(); 
 		else DequeueAndTransmit();
@@ -568,12 +699,29 @@ namespace ns3 {
 	}
 
 	bool QbbNetDevice::SwitchSend (uint32_t qIndex, Ptr<Packet> packet, CustomHeader &ch){
- 		m_macTxTrace(packet);
+		m_macTxTrace(packet);
 		m_traceEnqueue(packet, qIndex);
-		m_queue->Enqueue(packet, qIndex);
-		// DequeueAndTransmit();
-		SwitchDequeueAndTransmit();
-		return true;
+		bool queued = m_queue->Enqueue(packet, qIndex);
+		if (queued)
+		{
+			SwitchDequeueAndTransmit();
+		}
+		return queued;
+	}
+
+	bool QbbNetDevice::SwitchSend (uint32_t qIndex,
+	                              Ptr<Packet> packet,
+	                              CustomHeader &ch,
+	                              uint32_t sendSlot){
+		NS_ASSERT_MSG(m_calendarEnabled, "Calendar SwitchSend on an unconfigured port");
+		m_macTxTrace(packet);
+		m_traceEnqueue(packet, qIndex);
+		bool queued = m_queue->EnqueueCalendar(packet, qIndex, sendSlot);
+		if (queued)
+		{
+			SwitchDequeueAndTransmit();
+		}
+		return queued;
 	}
 
 	void QbbNetDevice::SendPfc(uint32_t qIndex, uint32_t type){

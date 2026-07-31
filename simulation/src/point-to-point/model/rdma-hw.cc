@@ -21,6 +21,68 @@
 
 namespace ns3{
 
+const uint64_t RdmaHw::FLOW_RX_BUCKET_NS;
+std::map<RdmaHw::FlowRxTraceKey, uint64_t> RdmaHw::m_flowRxBytes;
+std::set<RdmaHw::FlowRxTraceKey> RdmaHw::m_flowRxScheduled;
+
+bool
+RdmaHw::FlowRxTraceKey::operator< (const FlowRxTraceKey &other) const
+{
+	if (bucketStartNs != other.bucketStartNs) return bucketStartNs < other.bucketStartNs;
+	if (src != other.src) return src < other.src;
+	if (dst != other.dst) return dst < other.dst;
+	if (sport != other.sport) return sport < other.sport;
+	if (dport != other.dport) return dport < other.dport;
+	return pg < other.pg;
+}
+
+void
+RdmaHw::RecordFlowRxBytes(uint32_t src,
+                          uint32_t dst,
+                          uint16_t sport,
+                          uint16_t dport,
+                          uint16_t pg,
+                          uint32_t bytes)
+{
+	const uint64_t nowNs = static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
+	FlowRxTraceKey key;
+	key.bucketStartNs = (nowNs / FLOW_RX_BUCKET_NS) * FLOW_RX_BUCKET_NS;
+	key.src = src;
+	key.dst = dst;
+	key.sport = sport;
+	key.dport = dport;
+	key.pg = pg;
+	m_flowRxBytes[key] += bytes;
+
+	if (m_flowRxScheduled.insert(key).second)
+	{
+		const uint64_t bucketEndNs = key.bucketStartNs + FLOW_RX_BUCKET_NS;
+		const uint64_t delayNs = bucketEndNs > nowNs ? bucketEndNs - nowNs : 1;
+		Simulator::Schedule(NanoSeconds(delayNs), &RdmaHw::FlushFlowRxBucket, key);
+	}
+}
+
+void
+RdmaHw::FlushFlowRxBucket(FlowRxTraceKey key)
+{
+	std::map<FlowRxTraceKey, uint64_t>::iterator it = m_flowRxBytes.find(key);
+	if (it != m_flowRxBytes.end())
+	{
+		std::cout << "[FLOW_RX_BYTES]"
+		          << " t=" << key.bucketStartNs
+		          << " bucket_ns=" << FLOW_RX_BUCKET_NS
+		          << " src=" << key.src
+		          << " dst=" << key.dst
+		          << " sport=" << key.sport
+		          << " dport=" << key.dport
+		          << " pg=" << key.pg
+		          << " bytes=" << it->second
+		          << std::endl;
+		m_flowRxBytes.erase(it);
+	}
+	m_flowRxScheduled.erase(key);
+}
+
 TypeId RdmaHw::GetTypeId (void)
 {
 	static TypeId tid = TypeId ("ns3::RdmaHw")
@@ -724,7 +786,19 @@ int RdmaHw::ReceiveUdp(Ptr<QbbNetDevice> ingressDev, Ptr<Packet> p, CustomHeader
 	rxQp->m_ecn_source.total++;
 	rxQp->m_milestone_rx = m_ack_interval;
 
+	const bool acceptedNewData = (ch.udp.seq == rxQp->ReceiverNextExpectedSeq);
 	int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
+	if (acceptedNewData)
+	{
+		const uint32_t srcNode = (ch.sip >> 8) & 0xffff;
+		const uint32_t dstNode = (ch.dip >> 8) & 0xffff;
+		RecordFlowRxBytes(srcNode,
+		                  dstNode,
+		                  ch.udp.sport,
+		                  ch.udp.dport,
+		                  ch.udp.pg,
+		                  payload_size);
+	}
 	if (x == 1 || x == 2){ //generate ACK or NACK
 		qbbHeader seqh;
 		seqh.SetSeq(rxQp->ReceiverNextExpectedSeq);
@@ -839,7 +913,10 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 		}
 	}
 	if (ch.l3Prot == 0xFD) // NACK
+	{
+		qp->m_nackCount++;
 		RecoverQueue(qp);
+	}
 
 	// handle cnp
 	if (cnp){
@@ -934,6 +1011,20 @@ void RdmaHw::RecoverQueue(Ptr<RdmaQueuePair> qp){
 
 void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
 	NS_ASSERT(!m_qpCompleteCallback.IsNull());
+	std::cout << "[RNIC RETRANSMISSION STATS]"
+	          << " node=" << m_node->GetId()
+	          << " src=" << qp->m_src
+	          << " dst=" << qp->m_dest
+	          << " sport=" << qp->sport
+	          << " dport=" << qp->dport
+	          << " pg=" << qp->m_pg
+	          << " plane=" << (qp->m_hasBoundRnicPort ? static_cast<int64_t>(qp->m_boundPlaneId) : -1)
+	          << " rnic_port=" << (qp->m_hasBoundRnicPort ? static_cast<int64_t>(qp->m_boundRnicPort) : -1)
+	          << " retrans_packets=" << qp->m_retransPackets
+	          << " retrans_bytes=" << qp->m_retransBytes
+	          << " nack_count=" << qp->m_nackCount
+	          << " timeout_count=" << qp->m_timeoutCount
+	          << std::endl;
 	if (m_cc_mode == 1){
 		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
 		Simulator::Cancel(qp->mlx.m_eventDecreaseRate);
@@ -1017,6 +1108,17 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	PppHeader ppp;
 	ppp.SetProtocol (0x0021); // EtherToPpp(0x800), see point-to-point-net-device.cc
 	p->AddHeader (ppp);
+
+	// update retransmission accounting before advancing snd_nxt.
+	const uint64_t packetSeq = qp->snd_nxt;
+	if (packetSeq < qp->m_highestSentSeq)
+	{
+		qp->m_retransPackets++;
+		qp->m_retransBytes += std::min<uint64_t>(payload_size,
+		                                              qp->m_highestSentSeq - packetSeq);
+	}
+	qp->m_highestSentSeq = std::max<uint64_t>(qp->m_highestSentSeq,
+	                                          packetSeq + payload_size);
 
 	// update state
 	qp->snd_nxt += payload_size;

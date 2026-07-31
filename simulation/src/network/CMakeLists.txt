@@ -153,6 +153,7 @@ set(header_files
     utils/simple-drop-tail-queue.h
     utils/sll-header.h
     utils/broadcom-egress-queue.h
+    utils/calendar-queue.h
     utils/custom-header.h
     utils/int-header.h
     utils/red-queue.h

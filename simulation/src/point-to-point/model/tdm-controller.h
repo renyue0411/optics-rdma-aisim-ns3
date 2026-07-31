@@ -32,6 +32,7 @@ public:
   void SetNodeContainer (NodeContainer nodes);
 
   void AddOcsNode (uint32_t nodeId);
+  void AddTimeFlowSwitch (uint32_t nodeId);
 
   /*
    * The topology file uses stable logical port IDs.
@@ -67,6 +68,7 @@ public:
   void DumpRnicReachabilityWindows () const;
   void InstallTimeHashReachability () const;
   void InstallRdmaGateTables (uint32_t mode) const;
+  void InstallSwitchTimeFlowTables (uint32_t mode);
 
   uint32_t GetRnicGroupForNode (uint32_t nodeId) const;
   uint32_t GetRnicGroupForEndpoint (uint32_t nodeId,
@@ -121,6 +123,17 @@ private:
 
   uint32_t ResolveLogicalPortToIf (uint32_t nodeId,
                                    uint32_t logicalPort) const;
+  bool FindBindingByIfIndex (uint32_t nodeId,
+                             uint32_t ifIndex,
+                             uint32_t &logicalPort,
+                             PortBinding &binding) const;
+  bool FindScheduledPeerLogicalPort (uint32_t ocsId,
+                                     uint32_t inputLogicalPort,
+                                     uint32_t slice,
+                                     uint32_t &outputLogicalPort) const;
+  bool IsReachableWithoutOcs (uint32_t startNodeId,
+                              uint32_t dstNodeId,
+                              uint32_t excludedOcsId) const;
 
   bool IsOcsNode (uint32_t nodeId) const;
 
@@ -203,6 +216,7 @@ private:
   NodeContainer m_nodes;
 
   std::set<uint32_t> m_ocsNodeIds;
+  std::set<uint32_t> m_timeFlowSwitchIds;
 
   // nodeId -> logicalPort -> binding
   std::map<uint32_t, std::map<uint32_t, PortBinding> > m_portBindings;

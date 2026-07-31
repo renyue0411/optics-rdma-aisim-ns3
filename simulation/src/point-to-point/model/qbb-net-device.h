@@ -107,6 +107,15 @@ public:
    */
   virtual bool Send(Ptr<Packet> packet, const Address &dest, uint16_t protocolNumber);
   virtual bool SwitchSend (uint32_t qIndex, Ptr<Packet> packet, CustomHeader &ch);
+  virtual bool SwitchSend (uint32_t qIndex, Ptr<Packet> packet, CustomHeader &ch, uint32_t sendSlot);
+
+  void ConfigureCalendar(Time epochStart,
+                         Time sliceDuration,
+                         Time switchingTime,
+                         uint32_t numSlots,
+                         Time ingressLinkDelay);
+  bool IsCalendarEnabled() const;
+  uint32_t GetCalendarLookupSlot(uint32_t packetBytes) const;
 
   /**
    * Get the size of Tx buffer available in the device
@@ -160,6 +169,10 @@ protected:
   /// Resume a paused queue and call DequeueAndTransmit()
   virtual void Resume(unsigned qIndex);
 
+  void RefreshCalendarState(bool triggerTransmit);
+  void HandleCalendarBoundary();
+  bool CalendarPacketFits(Ptr<const Packet> packet) const;
+
   /**
    * The queues for each priority class.
    * @see class Queue
@@ -175,6 +188,14 @@ protected:
   bool m_dynamicth;
   uint32_t m_pausetime;	//< Time for each Pause
   bool m_paused[qCnt];	//< Whether a queue paused
+
+  bool m_calendarEnabled;
+  Time m_calendarEpochStart;
+  Time m_calendarSliceDuration;
+  Time m_calendarSwitchingTime;
+  Time m_calendarIngressLinkDelay;
+  uint32_t m_calendarNumSlots;
+  EventId m_calendarEvent;
   
   uint32_t nvls_enable;
 

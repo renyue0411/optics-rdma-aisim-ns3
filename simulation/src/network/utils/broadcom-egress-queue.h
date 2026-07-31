@@ -28,6 +28,7 @@
 #include "ns3/ptr.h"
 #include "packet-queue.h"
 #include "simple-drop-tail-queue.h"
+#include "calendar-queue.h"
 
 namespace ns3 {
 
@@ -42,7 +43,14 @@ namespace ns3 {
 		BEgressQueue();
 		virtual ~BEgressQueue();
 		bool Enqueue(Ptr<Packet> p, uint32_t qIndex);
+		bool EnqueueCalendar(Ptr<Packet> p, uint32_t qIndex, uint32_t sendSlot);
+		Ptr<const Packet> PeekRR(bool paused[], uint32_t &qIndex, bool &fromCalendar) const;
 		Ptr<Packet> DequeueRR(bool paused[]);
+		void ConfigureCalendar(uint32_t numSlots);
+		bool IsCalendarEnabled() const;
+		uint32_t GetCalendarNumSlots() const;
+		void SetActiveCalendarSlot(int32_t slot);
+		int32_t GetActiveCalendarSlot() const;
 		uint32_t GetNBytes(uint32_t qIndex) const;
 		uint32_t GetNBytesTotal() const;
 		uint32_t GetLastQueue();
@@ -68,6 +76,8 @@ namespace ns3 {
    		 */
   		Ptr<const Packet> Peek (void) const;
 		bool DoEnqueue(Ptr<Packet> p, uint32_t qIndex);
+		bool DoEnqueueCalendar(Ptr<Packet> p, uint32_t qIndex, uint32_t sendSlot);
+		bool SelectNextQueue(bool paused[], uint32_t &qIndex, bool &fromCalendar) const;
 		Ptr<Packet> DoDequeueRR(bool paused[]);
 		//for compatibility
 		virtual bool DoEnqueue(Ptr<Packet> p);
@@ -79,6 +89,9 @@ namespace ns3 {
 		uint32_t m_rrlast;
 		uint32_t m_qlast;
 		std::vector<Ptr<SimpleDropTailQueue>> m_queues; // uc queues
+		CalendarQueue m_calendarQueue;
+		bool m_calendarEnabled;
+		int32_t m_activeCalendarSlot;
 		
 		TracedCallback<Ptr<const Packet> > m_traceEnqueue;
   		TracedCallback<Ptr<const Packet> > m_traceDequeue;

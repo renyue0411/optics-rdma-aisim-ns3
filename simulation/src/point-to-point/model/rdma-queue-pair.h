@@ -21,6 +21,11 @@ public:
 	uint64_t m_postedLimit; // userspace-visible posted byte limit
 	uint32_t m_src, m_dest;
 	uint64_t snd_nxt, snd_una; // next seq to send, the highest unacked seq
+	uint64_t m_highestSentSeq;
+	uint64_t m_retransPackets;
+	uint64_t m_retransBytes;
+	uint64_t m_nackCount;
+	uint64_t m_timeoutCount;
 	uint16_t m_pg;
 	uint16_t m_ipid;
 	uint32_t m_win; // bound of on-the-fly packets
