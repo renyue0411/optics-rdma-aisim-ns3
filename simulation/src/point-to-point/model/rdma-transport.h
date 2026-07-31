@@ -72,6 +72,26 @@ public:
     void NotifyRecover(Ptr<RdmaQueuePair> qp);
 
 private:
+    struct GateLookupResult
+    {
+        bool bypass;
+        bool allowed;
+        Time currentWindowEnd;
+        Time nextAllowedTime;
+
+        GateLookupResult()
+            : bypass(false),
+              allowed(false),
+              currentWindowEnd(Time(0)),
+              nextAllowedTime(Time(0))
+        {
+        }
+    };
+
+    GateLookupResult LookupGate(
+        Ptr<RdmaQueuePair> qp,
+        Time now) const;
+
     bool Allows(
         Ptr<RdmaQueuePair> qp,
         Time now) const;
@@ -86,12 +106,8 @@ private:
         Ptr<RdmaQueuePair> qp,
         Time wakeTime);
 
-    Time GetCurrentWindowEndTime(
-        Ptr<RdmaQueuePair> qp,
-        Time now) const;
-
     uint64_t GetSafeBudgetBytes(
-        Ptr<RdmaQueuePair> qp,
+        const GateLookupResult& gate,
         Time now) const;
 
     void MaybeAdapt(Ptr<RdmaQueuePair> qp);

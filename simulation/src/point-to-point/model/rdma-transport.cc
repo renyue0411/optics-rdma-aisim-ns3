@@ -534,47 +534,80 @@ RdmaTransport::GetNextRnicGateTime(Ptr<RdmaQueuePair> qp) const
     return GetNextAllowedTime(qp, Simulator::Now());
 }
 
-bool
-RdmaTransport::Allows(
+RdmaTransport::GateLookupResult
+RdmaTransport::LookupGate(
     Ptr<RdmaQueuePair> qp,
     Time now) const
 {
-    if (!m_gateEnabled || qp == NULL)
+    GateLookupResult result;
+    result.currentWindowEnd = now;
+    result.nextAllowedTime = Simulator::GetMaximumSimulationTime();
+
+    if (!m_gateEnabled || qp == NULL || !qp->m_hasBoundRnicPort)
     {
-        return true;
-    }
-    if (!qp->m_hasBoundRnicPort)
-    {
-        return true; // scale-up QP bypasses OCS injection windows
+        result.bypass = true;
+        result.allowed = true;
+        result.currentWindowEnd = Simulator::GetMaximumSimulationTime();
+        result.nextAllowedTime = now;
+        return result;
     }
 
     std::map<uint32_t, GateTable>::const_iterator tableIt =
         m_gateTables.find(qp->m_boundRnicPort);
     if (tableIt == m_gateTables.end() || tableIt->second.periodNs == 0)
     {
-        return false;
+        return result;
     }
+
     const GateTable& table = tableIt->second;
-    uint32_t dstNodeId = (qp->dip.Get() >> 8) & 0xffff;
-    uint64_t nowNs = static_cast<uint64_t>(now.GetNanoSeconds());
-    uint64_t offsetNs = nowNs >= table.epochStartNs
+    const uint32_t dstNodeId = qp->GetDest();
+    const uint32_t wordIndex = dstNodeId / 64;
+    const uint32_t bitIndex = dstNodeId % 64;
+    const uint64_t nowNs = static_cast<uint64_t>(now.GetNanoSeconds());
+    const uint64_t offsetNs = nowNs >= table.epochStartNs
         ? (nowNs - table.epochStartNs) % table.periodNs
         : (table.periodNs -
            ((table.epochStartNs - nowNs) % table.periodNs)) % table.periodNs;
+    const uint64_t periodBaseNs = nowNs - offsetNs;
+    uint64_t bestDeltaNs = std::numeric_limits<uint64_t>::max();
 
     for (uint32_t i = 0; i < table.slots.size(); ++i)
     {
-        const RdmaTransport::GateSlotEntry& slot = table.slots[i];
-        if (offsetNs < slot.startOffsetNs || offsetNs >= slot.endOffsetNs)
+        const GateSlotEntry& slot = table.slots[i];
+        if (wordIndex >= slot.dstRnicBitmapWords.size() ||
+            (slot.dstRnicBitmapWords[wordIndex] & (1ULL << bitIndex)) == 0)
         {
             continue;
         }
-        uint32_t wordIndex = dstNodeId / 64;
-        uint32_t bitIndex = dstNodeId % 64;
-        return wordIndex < slot.dstRnicBitmapWords.size() &&
-            (slot.dstRnicBitmapWords[wordIndex] & (1ULL << bitIndex)) != 0;
+
+        if (offsetNs >= slot.startOffsetNs && offsetNs < slot.endOffsetNs)
+        {
+            result.allowed = true;
+            result.currentWindowEnd = NanoSeconds(periodBaseNs + slot.endOffsetNs);
+            result.nextAllowedTime = now;
+            return result;
+        }
+
+        const uint64_t deltaNs = offsetNs < slot.startOffsetNs
+            ? slot.startOffsetNs - offsetNs
+            : table.periodNs - offsetNs + slot.startOffsetNs;
+        bestDeltaNs = std::min(bestDeltaNs, deltaNs);
     }
-    return false;
+
+    if (bestDeltaNs != std::numeric_limits<uint64_t>::max())
+    {
+        result.nextAllowedTime = now + NanoSeconds(bestDeltaNs);
+    }
+
+    return result;
+}
+
+bool
+RdmaTransport::Allows(
+    Ptr<RdmaQueuePair> qp,
+    Time now) const
+{
+    return LookupGate(qp, now).allowed;
 }
 
 Time
@@ -582,137 +615,39 @@ RdmaTransport::GetNextAllowedTime(
     Ptr<RdmaQueuePair> qp,
     Time now) const
 {
-    if (!m_gateEnabled || qp == NULL || !qp->m_hasBoundRnicPort)
-    {
-        return now;
-    }
-
-    std::map<uint32_t, GateTable>::const_iterator tableIt =
-        m_gateTables.find(qp->m_boundRnicPort);
-    if (tableIt == m_gateTables.end() || tableIt->second.periodNs == 0)
-    {
-        return Simulator::GetMaximumSimulationTime();
-    }
-    const GateTable& table = tableIt->second;
-    uint32_t dstNodeId = (qp->dip.Get() >> 8) & 0xffff;
-    uint64_t nowNs = static_cast<uint64_t>(now.GetNanoSeconds());
-    uint64_t offsetNs = nowNs >= table.epochStartNs
-        ? (nowNs - table.epochStartNs) % table.periodNs
-        : (table.periodNs -
-           ((table.epochStartNs - nowNs) % table.periodNs)) % table.periodNs;
-    uint64_t bestDeltaNs = std::numeric_limits<uint64_t>::max();
-
-    for (uint32_t i = 0; i < table.slots.size(); ++i)
-    {
-        const RdmaTransport::GateSlotEntry& slot = table.slots[i];
-        uint32_t wordIndex = dstNodeId / 64;
-        uint32_t bitIndex = dstNodeId % 64;
-        if (wordIndex >= slot.dstRnicBitmapWords.size() ||
-            (slot.dstRnicBitmapWords[wordIndex] & (1ULL << bitIndex)) == 0)
-        {
-            continue;
-        }
-        uint64_t deltaNs = offsetNs < slot.startOffsetNs
-            ? slot.startOffsetNs - offsetNs
-            : (offsetNs < slot.endOffsetNs
-                ? 0
-                : table.periodNs - offsetNs + slot.startOffsetNs);
-        bestDeltaNs = std::min(bestDeltaNs, deltaNs);
-    }
-
-    if (bestDeltaNs == std::numeric_limits<uint64_t>::max())
-    {
-        return Simulator::GetMaximumSimulationTime();
-    }
-    return now + NanoSeconds(bestDeltaNs);
-}
-
-Time
-RdmaTransport::GetCurrentWindowEndTime(
-    Ptr<RdmaQueuePair> qp,
-    Time now) const
-{
-    if (!m_gateEnabled || qp == NULL || !qp->m_hasBoundRnicPort)
-    {
-        return Simulator::GetMaximumSimulationTime();
-    }
-
-    std::map<uint32_t, GateTable>::const_iterator tableIt =
-        m_gateTables.find(qp->m_boundRnicPort);
-    if (tableIt == m_gateTables.end() || tableIt->second.periodNs == 0)
-    {
-        return now;
-    }
-    const GateTable& table = tableIt->second;
-    uint32_t dstNodeId = (qp->dip.Get() >> 8) & 0xffff;
-    uint64_t nowNs = static_cast<uint64_t>(now.GetNanoSeconds());
-    uint64_t offsetNs = nowNs >= table.epochStartNs
-        ? (nowNs - table.epochStartNs) % table.periodNs
-        : (table.periodNs -
-           ((table.epochStartNs - nowNs) % table.periodNs)) % table.periodNs;
-    uint64_t periodBaseNs = nowNs - offsetNs;
-
-    for (uint32_t i = 0; i < table.slots.size(); ++i)
-    {
-        const RdmaTransport::GateSlotEntry& slot = table.slots[i];
-        if (offsetNs < slot.startOffsetNs || offsetNs >= slot.endOffsetNs)
-        {
-            continue;
-        }
-        uint32_t wordIndex = dstNodeId / 64;
-        uint32_t bitIndex = dstNodeId % 64;
-        if (wordIndex >= slot.dstRnicBitmapWords.size() ||
-            (slot.dstRnicBitmapWords[wordIndex] & (1ULL << bitIndex)) == 0)
-        {
-            return now;
-        }
-        return NanoSeconds(periodBaseNs + slot.endOffsetNs);
-    }
-    return now;
+    return LookupGate(qp, now).nextAllowedTime;
 }
 
 uint64_t
 RdmaTransport::GetSafeBudgetBytes(
-    Ptr<RdmaQueuePair> qp,
+    const GateLookupResult& gate,
     Time now) const
 {
-    if (qp != NULL && !qp->m_hasBoundRnicPort)
+    if (gate.bypass)
     {
         return m_maxOutstandingBytes;
     }
 
-    Time endTime =
-        GetCurrentWindowEndTime(qp, now);
-
-    if (endTime <= now)
+    if (!gate.allowed || gate.currentWindowEnd <= now)
     {
         return 0;
     }
 
-    uint64_t nowNs =
-        static_cast<uint64_t>(
-            now.GetNanoSeconds());
-
-    uint64_t endNs =
-        static_cast<uint64_t>(
-            endTime.GetNanoSeconds());
+    const uint64_t nowNs =
+        static_cast<uint64_t>(now.GetNanoSeconds());
+    const uint64_t endNs =
+        static_cast<uint64_t>(gate.currentWindowEnd.GetNanoSeconds());
 
     if (endNs <= nowNs + m_tailGuardNs)
     {
         return 0;
     }
 
-    uint64_t usableNs =
-        endNs - nowNs - m_tailGuardNs;
+    const uint64_t usableNs = endNs - nowNs - m_tailGuardNs;
 
     // bytes = bps * ns / 8 / 1e9
-    uint64_t budgetBytes =
-        (m_safeRateBps * usableNs) /
-        8000000000ULL;
-
-    return budgetBytes;
+    return (m_safeRateBps * usableNs) / 8000000000ULL;
 }
-
 
 uint64_t
 RdmaTransport::GetAdaptivePeriodNs() const
@@ -839,7 +774,7 @@ RdmaTransport::MaybeAdapt(Ptr<RdmaQueuePair> qp)
 
         if (qp != NULL)
         {
-            dstNodeId = (qp->dip.Get() >> 8) & 0xffff;
+            dstNodeId = qp->GetDest();
             unposted = qp->GetUnpostedBytes();
             outstanding = qp->GetPostedOutstandingBytes();
         }
@@ -973,7 +908,7 @@ RdmaTransport::RecordPost(
                 : 0;
 
         uint32_t dstNodeId =
-            (qp->dip.Get() >> 8) & 0xffff;
+            qp->GetDest();
 
         std::cout
             << "[USERSPACE WR POST SAMPLE]"
@@ -1025,7 +960,7 @@ RdmaTransport::FlushPostSummary(
             : 0;
 
     uint32_t dstNodeId =
-        (qp->dip.Get() >> 8) & 0xffff;
+        qp->GetDest();
 
     uint64_t avgBytes =
         st.postCount > 0
@@ -1065,62 +1000,42 @@ RdmaTransport::TrySubmit(
         return;
     }
 
-    Time now = Simulator::Now();
-
     if (qp->GetUnpostedBytes() > 0)
     {
         m_backlogSinceLastAdapt = true;
     }
 
-    if (!Allows(qp, now))
-    {
-        ScheduleNextWake(
-            qp,
-            GetNextAllowedTime(qp, now));
-
-        return;
-    }
-
-    uint64_t outstanding =
-        qp->GetPostedOutstandingBytes();
+    uint64_t outstanding = qp->GetPostedOutstandingBytes();
 
     while (qp->GetUnpostedBytes() > 0)
     {
-        Time loopNow = Simulator::Now();
+        const Time loopNow = Simulator::Now();
+        const GateLookupResult gate = LookupGate(qp, loopNow);
 
-        if (!Allows(qp, loopNow))
+        if (!gate.allowed)
         {
-            ScheduleNextWake(
-                qp,
-                GetNextAllowedTime(qp, loopNow));
-
+            ScheduleNextWake(qp, gate.nextAllowedTime);
             break;
         }
 
-        uint64_t safeBudget =
-            GetSafeBudgetBytes(qp, loopNow);
+        const uint64_t safeBudget = GetSafeBudgetBytes(gate, loopNow);
 
         if (safeBudget < m_minPostBytes)
         {
             m_backlogSinceLastAdapt = true;
-            Time currentWindowEnd =
-                GetCurrentWindowEndTime(qp, loopNow);
 
-            if (currentWindowEnd > loopNow &&
-                currentWindowEnd !=
-                    Simulator::GetMaximumSimulationTime())
+            if (gate.currentWindowEnd > loopNow &&
+                gate.currentWindowEnd != Simulator::GetMaximumSimulationTime())
             {
-                ScheduleNextWake(
-                    qp,
-                    GetNextAllowedTime(
-                        qp,
-                        currentWindowEnd + NanoSeconds(1)));
+                const GateLookupResult nextGate =
+                    LookupGate(qp, gate.currentWindowEnd + NanoSeconds(1));
+                ScheduleNextWake(qp, nextGate.nextAllowedTime);
             }
 
             break;
         }
 
-        uint64_t outstandingHeadroom =
+        const uint64_t outstandingHeadroom =
             m_maxOutstandingBytes > outstanding
                 ? m_maxOutstandingBytes - outstanding
                 : 0;
@@ -1131,46 +1046,29 @@ RdmaTransport::TrySubmit(
             break;
         }
 
-        uint64_t unpostedBytes =
-            qp->GetUnpostedBytes();
+        const uint64_t unpostedBytes = qp->GetUnpostedBytes();
 
-        uint64_t nextWrBytes =
-            std::min(
-                m_wrChunkBytes,
-                unpostedBytes);
+        uint64_t nextWrBytes = std::min(m_wrChunkBytes, unpostedBytes);
+        nextWrBytes = std::min(nextWrBytes, outstandingHeadroom);
+        nextWrBytes = std::min(nextWrBytes, safeBudget);
 
-        nextWrBytes =
-            std::min(
-                nextWrBytes,
-                outstandingHeadroom);
+        const bool isFinalTail = nextWrBytes == unpostedBytes;
 
-        nextWrBytes =
-            std::min(
-                nextWrBytes,
-                safeBudget);
-
-        bool isFinalTail =
-            nextWrBytes == unpostedBytes;
-
-        if (nextWrBytes < m_minPostBytes &&
-            !isFinalTail)
+        if (nextWrBytes < m_minPostBytes && !isFinalTail)
         {
             break;
         }
 
-        m_rdma->PostWork(
-            qp,
-            nextWrBytes);
-
+        m_rdma->PostWork(qp, nextWrBytes);
         outstanding += nextWrBytes;
 
+        // Simulator time does not advance inside PostWork(), so the lookup
+        // result obtained for this admission decision remains valid.
         RecordPost(
             qp,
             nextWrBytes,
             safeBudget,
-            GetCurrentWindowEndTime(
-                qp,
-                Simulator::Now()));
+            gate.currentWindowEnd);
     }
 
     MaybeAdapt(qp);

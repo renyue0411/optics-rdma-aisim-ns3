@@ -112,8 +112,8 @@ public:
 
 	uint64_t GetBytesLeft();
 	uint64_t GetInitialSize();
-	uint32_t GetSrc();
-	uint32_t GetDest();
+	uint32_t GetSrc() const;
+	uint32_t GetDest() const;
 	uint64_t GetTag();
 	void SetTag(uint64_t tag);void SetSrc(uint32_t src);void SetDest(uint32_t dest);void SetInitialSize(uint64_t size);
 	uint32_t GetHash(void);

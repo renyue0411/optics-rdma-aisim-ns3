@@ -96,11 +96,11 @@ void RdmaQueuePair::SetDest(uint32_t dest){
 	m_dest = dest;
 }
 
-uint32_t RdmaQueuePair::GetSrc(){
+uint32_t RdmaQueuePair::GetSrc() const{
 	return m_src;
 }
 
-uint32_t RdmaQueuePair::GetDest(){
+uint32_t RdmaQueuePair::GetDest() const{
 	return m_dest;
 }
 
