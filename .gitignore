@@ -20,3 +20,6 @@ simulation/cmake-cache/*
 simulation/cmake-cache/*
 
 !simulation/cmake-cache/.gitkeep
+# Local ns-3 build artifacts
+/simulation/build/
+/simulation/.lock-ns3_linux_build
