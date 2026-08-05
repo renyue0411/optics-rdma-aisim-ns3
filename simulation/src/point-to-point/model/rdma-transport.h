@@ -18,6 +18,7 @@
 // MODE2_PER_PORT_AGGREGATE_ADMISSION_V1: account all in-flight WR bytes per breakout port.
 // MODE2_PORT_QP_LOGGING_V1: separate configured QP hint from runtime per-port QP count.
 // MODE2_DEFAULT_PIPELINE_V1: default Mode 2 uses a fixed-depth WR/CQE pipeline.
+// MODE1_CONTINUATION_ACK_RECOVERY_V1: bounded next-window DATA probing.
 
 namespace ns3 {
 
@@ -104,12 +105,14 @@ private:
     {
         bool bypass;
         bool allowed;
+        Time currentWindowStart;
         Time currentWindowEnd;
         Time nextAllowedTime;
 
         GateLookupResult()
             : bypass(false),
               allowed(false),
+              currentWindowStart(Time(0)),
               currentWindowEnd(Time(0)),
               nextAllowedTime(Time(0))
         {
@@ -162,6 +165,20 @@ private:
 
     GateLookupResult LookupGate(
         Ptr<RdmaQueuePair> qp,
+        Time now) const;
+
+    Time GetNextPhysicalWindowStart(
+        Ptr<RdmaQueuePair> qp,
+        const GateLookupResult& gate) const;
+
+    void ArmRnicAckRecovery(
+        Ptr<RdmaQueuePair> qp,
+        const GateLookupResult& gate,
+        const char* reason) const;
+
+    bool CanSendRnicContinuationProbe(
+        Ptr<RdmaQueuePair> qp,
+        const GateLookupResult& gate,
         Time now) const;
 
     bool Allows(

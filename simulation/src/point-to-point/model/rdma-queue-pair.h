@@ -10,6 +10,8 @@
 #include <ns3/int-header.h>
 #include <vector>
 
+// MODE1_CONTINUATION_ACK_RECOVERY_V1: bounded next-window DATA probing.
+
 namespace ns3 {
 
 class RdmaQueuePair : public Object {
@@ -31,6 +33,11 @@ public:
 	bool m_deadlineSampleOutstanding;
 	uint64_t m_deadlineSampleSeq;
 	uint64_t m_deadlineSampleTxNs;
+	uint64_t m_deadlineSampleWindowStartNs;
+	uint64_t m_deadlineSampleWindowEndNs;
+	uint64_t m_deadlineLastAllowedWindowStartNs;
+	uint64_t m_deadlineLastAllowedWindowEndNs;
+	uint64_t m_deadlineRejectedCrossWindowSamples;
 	uint64_t m_deadlineSrttNs;
 	uint64_t m_deadlineRttVarNs;
 	uint32_t m_deadlineValidSamples;
@@ -42,6 +49,29 @@ public:
 	uint64_t m_deadlineLastPacketSeq;
 	uint64_t m_deadlineLastPacketEndSeq;
 	bool m_deadlineLastPacketWasRetransmission;
+
+	// Mode-1 schedule-aware ACK recovery.  These fields are RNIC-local QP
+	// context; no packet buffering or switch-side state is introduced.
+	bool m_ackRecoveryActive;
+	bool m_ackRecoveryPermit;
+	bool m_ackRecoveryProbeInFlight;
+	uint64_t m_ackRecoveryNextWindowStartNs;
+	uint64_t m_ackRecoveryLastArmWindowEndNs;
+	uint64_t m_ackRecoveryPermitWindowStartNs;
+	uint64_t m_ackRecoveryLastProbeWindowStartNs;
+	uint64_t m_ackRecoveryProbeStartSeq;
+	uint64_t m_ackRecoveryProbeEndSeq;
+	uint64_t m_ackRecoveryLastAckProgressNs;
+	uint64_t m_ackRecoveryLastAckProgressSeq;
+	uint32_t m_ackRecoveryAttempts;
+	uint64_t m_ackRecoveryArmCount;
+	uint64_t m_ackRecoveryProbeCount;
+	uint64_t m_ackRecoverySuccessCount;
+	uint64_t m_ackRecoveryDelayedAckCount;
+	uint64_t m_ackRecoveryNackCount;
+	uint64_t m_ackRecoveryExhaustedCount;
+	uint64_t m_ackRecoveryNoContinuationCount;
+
 	uint16_t m_pg;
 	uint16_t m_ipid;
 	uint32_t m_win; // bound of on-the-fly packets

@@ -48,6 +48,7 @@
 #include "ns3/pointer.h"
 #include "ns3/custom-header.h"
 #include <iostream>
+// MODE1_CONTINUATION_ACK_RECOVERY_V1: gate may grant one bounded window bypass.
 NS_LOG_COMPONENT_DEFINE("QbbNetDevice");
 
 namespace ns3 {
@@ -115,10 +116,14 @@ namespace ns3 {
 				int t_count = qp->GetInitialSize();
 				// qp transmission finished
 			}
-			if (!paused[qp->m_pg] && qp->GetBytesLeft() > 0 && !qp->IsWinBound()){
+			if (!paused[qp->m_pg] && qp->GetBytesLeft() > 0){
 				if (m_qpGrp->Get(idx)->m_nextAvail.GetTimeStep() > Simulator::Now().GetTimeStep()) //not available now
 					continue;
 
+				// Consult the Mode-1 gate even when the ordinary transport window
+				// is full.  The gate may grant one next-window continuation
+				// packet; without that explicit permit, IsWinBound() remains
+				// authoritative for all modes.
 				if (!m_rdmaGateAllowQp.IsNull() && !m_rdmaGateAllowQp(qp)){
 					if (!m_rdmaGateNextTime.IsNull()){
 						Time t = m_rdmaGateNextTime(qp);
@@ -128,6 +133,11 @@ namespace ns3 {
 					}
 					continue;
 				}
+
+				if (qp->IsWinBound() && !qp->m_ackRecoveryPermit){
+					continue;
+				}
+
 				res = idx;
 				break;
 			}else if (qp->IsFinished()){

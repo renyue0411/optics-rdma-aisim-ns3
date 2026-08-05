@@ -20,6 +20,7 @@
 #include <limits>
 
 // MODE2_CQE_SEMANTICS_V1: complete WR boundaries generate CQE callbacks.
+// MODE1_CONTINUATION_ACK_RECOVERY_V1: bounded next-window DATA probing.
 
 namespace ns3{
 
@@ -276,6 +277,7 @@ RdmaHw::RdmaHw(){
 	m_rnicDeadlineInitialGuardNs = 0;
 	m_rnicDeadlineMinRttSamples = 4;
 	m_rnicDeadlineRttVarMultiplier = 4;
+	m_rnicAckRecoveryEnabled = false;
 }
 
 void RdmaHw::enable_nvls() {
@@ -504,6 +506,94 @@ bool RdmaHw::IsRnicDeadlineEnabled() const{
 	return m_rnicDeadlineEnabled;
 }
 
+void RdmaHw::ConfigureRnicAckRecovery(bool enabled){
+	m_rnicAckRecoveryEnabled = enabled;
+	if (m_rnicAckRecoveryEnabled){
+		std::cout << "[RNIC ACK RECOVERY CONFIG]"
+		          << " node="
+		          << (m_node != NULL ? static_cast<int64_t>(m_node->GetId()) : -1)
+		          << " enabled=1"
+		          << " probe_bytes=" << m_mtu
+		          << " max_attempts=" << GetRnicAckRecoveryMaxAttempts()
+		          << " policy=next_window_continuation_data"
+		          << std::endl;
+	}
+}
+
+bool RdmaHw::IsRnicAckRecoveryEnabled() const{
+	return m_rnicAckRecoveryEnabled;
+}
+
+uint32_t RdmaHw::GetRnicAckRecoveryMaxAttempts() const{
+	return 3;
+}
+
+void RdmaHw::ResetRnicAckRecoveryState(Ptr<RdmaQueuePair> qp){
+	if (qp == NULL){
+		return;
+	}
+	qp->m_ackRecoveryActive = false;
+	qp->m_ackRecoveryPermit = false;
+	qp->m_ackRecoveryProbeInFlight = false;
+	qp->m_ackRecoveryNextWindowStartNs = 0;
+	qp->m_ackRecoveryPermitWindowStartNs = 0;
+	qp->m_ackRecoveryProbeStartSeq = 0;
+	qp->m_ackRecoveryProbeEndSeq = 0;
+	qp->m_ackRecoveryAttempts = 0;
+}
+
+void RdmaHw::HandleRnicAckRecoveryProgress(Ptr<RdmaQueuePair> qp,
+	                                          uint64_t oldUna,
+	                                          uint64_t ackSeq){
+	if (!m_rnicAckRecoveryEnabled || qp == NULL || qp->snd_una <= oldUna){
+		return;
+	}
+
+	const uint64_t nowNs =
+		static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
+	qp->m_ackRecoveryLastAckProgressNs = nowNs;
+	qp->m_ackRecoveryLastAckProgressSeq = qp->snd_una;
+
+	if (!qp->m_ackRecoveryActive){
+		return;
+	}
+
+	if (qp->m_ackRecoveryProbeInFlight){
+		if (qp->snd_una >= qp->m_ackRecoveryProbeEndSeq){
+			qp->m_ackRecoverySuccessCount++;
+			std::cout << "[RNIC ACK RECOVERY SUCCESS]"
+			          << " t_ns=" << nowNs
+			          << " node=" << m_node->GetId()
+			          << " src=" << qp->m_src
+			          << " dst=" << qp->m_dest
+			          << " sport=" << qp->sport
+			          << " ack_seq=" << ackSeq
+			          << " snd_una=" << qp->snd_una
+			          << " probe_start_seq=" << qp->m_ackRecoveryProbeStartSeq
+			          << " probe_end_seq=" << qp->m_ackRecoveryProbeEndSeq
+			          << " attempts=" << qp->m_ackRecoveryAttempts
+			          << std::endl;
+			ResetRnicAckRecoveryState(qp);
+		}
+		return;
+	}
+
+	// A delayed cumulative ACK arrived before the continuation packet was
+	// transmitted.  Normal transport credit is authoritative from here.
+	qp->m_ackRecoveryDelayedAckCount++;
+	std::cout << "[RNIC ACK RECOVERY DELAYED ACK]"
+	          << " t_ns=" << nowNs
+	          << " node=" << m_node->GetId()
+	          << " src=" << qp->m_src
+	          << " dst=" << qp->m_dest
+	          << " sport=" << qp->sport
+	          << " old_una=" << oldUna
+	          << " new_una=" << qp->snd_una
+	          << " ack_seq=" << ackSeq
+	          << std::endl;
+	ResetRnicAckRecoveryState(qp);
+}
+
 uint64_t RdmaHw::GetRnicDeadlineReserveNs(Ptr<RdmaQueuePair> qp) const{
 	if (!m_rnicDeadlineEnabled || qp == NULL){
 		return 0;
@@ -540,6 +630,40 @@ void RdmaHw::UpdateRnicDeadlineRtt(Ptr<RdmaQueuePair> qp, uint64_t ackSeq){
 
 	const uint64_t nowNs =
 		static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
+
+	// Deadline RTT is the DATA-to-ACK latency while the scheduled circuit is
+	// continuously available.  A cumulative ACK that arrives after the
+	// transmission window closed includes OCS schedule waiting and must not
+	// inflate the path RTT estimator.
+	if (qp->m_deadlineSampleWindowEndNs != 0 &&
+		nowNs > qp->m_deadlineSampleWindowEndNs){
+		qp->m_deadlineRejectedCrossWindowSamples++;
+		std::cout << "[RNIC DEADLINE SAMPLE REJECT]"
+		          << " t_ns=" << nowNs
+		          << " node="
+		          << (m_node != NULL
+		                  ? static_cast<int64_t>(m_node->GetId())
+		                  : -1)
+		          << " src=" << qp->m_src
+		          << " dst=" << qp->m_dest
+		          << " sport=" << qp->sport
+		          << " ack_seq=" << ackSeq
+		          << " sample_seq=" << qp->m_deadlineSampleSeq
+		          << " sample_tx_ns=" << qp->m_deadlineSampleTxNs
+		          << " sample_window_start_ns="
+		          << qp->m_deadlineSampleWindowStartNs
+		          << " sample_window_end_ns="
+		          << qp->m_deadlineSampleWindowEndNs
+		          << " observed_ns="
+		          << (nowNs >= qp->m_deadlineSampleTxNs
+		                  ? nowNs - qp->m_deadlineSampleTxNs
+		                  : 0)
+		          << " reason=cross_window"
+		          << std::endl;
+		qp->m_deadlineSampleOutstanding = false;
+		return;
+	}
+
 	if (nowNs >= qp->m_deadlineSampleTxNs){
 		const uint64_t sampleNs = nowNs - qp->m_deadlineSampleTxNs;
 		if (qp->m_deadlineValidSamples == 0){
@@ -1052,13 +1176,15 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 	else {
 		const uint64_t effectiveAckSeq =
 			m_backto0 ? (seq / m_chunk * m_chunk) : seq;
+		const uint64_t oldUna = qp->snd_una;
 		if (ch.l3Prot == 0xFC){
 			UpdateRnicDeadlineRtt(qp, effectiveAckSeq);
 		}
 		qp->Acknowledge(effectiveAckSeq);
 		if (ch.l3Prot == 0xFC){
-		GenerateWrCompletions(qp);
-	}
+			HandleRnicAckRecoveryProgress(qp, oldUna, effectiveAckSeq);
+			GenerateWrCompletions(qp);
+		}
 		if (qp->IsFinished()){
 			QpComplete(qp);
 		}
@@ -1155,6 +1281,21 @@ uint16_t RdmaHw::EtherToPpp (uint16_t proto){
 
 void RdmaHw::RecoverQueue(Ptr<RdmaQueuePair> qp){
 	InvalidateRnicDeadlineSample(qp);
+	if (m_rnicAckRecoveryEnabled && qp != NULL &&
+		(qp->m_ackRecoveryActive || qp->m_ackRecoveryProbeInFlight)){
+		qp->m_ackRecoveryNackCount++;
+		std::cout << "[RNIC ACK RECOVERY NACK]"
+		          << " t_ns=" << Simulator::Now().GetNanoSeconds()
+		          << " node=" << m_node->GetId()
+		          << " src=" << qp->m_src
+		          << " dst=" << qp->m_dest
+		          << " sport=" << qp->sport
+		          << " recover_seq=" << qp->snd_una
+		          << " probe_start_seq=" << qp->m_ackRecoveryProbeStartSeq
+		          << " probe_end_seq=" << qp->m_ackRecoveryProbeEndSeq
+		          << std::endl;
+	}
+	ResetRnicAckRecoveryState(qp);
 	qp->snd_nxt = qp->snd_una;
 }
 
@@ -1174,6 +1315,8 @@ void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
 	          << " nack_count=" << qp->m_nackCount
 	          << " timeout_count=" << qp->m_timeoutCount
 	          << " deadline_samples=" << qp->m_deadlineValidSamples
+	          << " deadline_rejected_cross_window_samples="
+	          << qp->m_deadlineRejectedCrossWindowSamples
 	          << " deadline_srtt_ns=" << qp->m_deadlineSrttNs
 	          << " deadline_rttvar_ns=" << qp->m_deadlineRttVarNs
 	          << " deadline_reserve_ns=" << GetRnicDeadlineReserveNs(qp)
@@ -1183,6 +1326,18 @@ void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
 	          << " deadline_block_events=" << qp->m_deadlineBlockEventCount
 	          << " deadline_last_blocked_window_end_ns="
 	          << qp->m_deadlineLastBlockedWindowEndNs
+	          << " ack_recovery_arms=" << qp->m_ackRecoveryArmCount
+	          << " ack_recovery_probes=" << qp->m_ackRecoveryProbeCount
+	          << " ack_recovery_success=" << qp->m_ackRecoverySuccessCount
+	          << " ack_recovery_delayed_ack=" << qp->m_ackRecoveryDelayedAckCount
+	          << " ack_recovery_nack=" << qp->m_ackRecoveryNackCount
+	          << " ack_recovery_exhausted=" << qp->m_ackRecoveryExhaustedCount
+	          << " ack_recovery_no_continuation="
+	          << qp->m_ackRecoveryNoContinuationCount
+	          << " ack_recovery_attempts=" << qp->m_ackRecoveryAttempts
+	          << " ack_recovery_active=" << (qp->m_ackRecoveryActive ? 1 : 0)
+	          << " ack_recovery_probe_in_flight="
+	          << (qp->m_ackRecoveryProbeInFlight ? 1 : 0)
 	          << std::endl;
 	if (m_cc_mode == 1){
 		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
@@ -1276,6 +1431,44 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	qp->m_deadlineLastPacketWasRetransmission =
 		(packetSeq < qp->m_highestSentSeq);
 
+	const bool continuationProbe = qp->m_ackRecoveryPermit;
+	if (continuationProbe){
+		NS_ASSERT_MSG(!qp->m_deadlineLastPacketWasRetransmission,
+		              "Continuation recovery must send new sequence space");
+		qp->m_ackRecoveryPermit = false;
+		qp->m_ackRecoveryProbeInFlight = true;
+		qp->m_ackRecoveryLastProbeWindowStartNs =
+			qp->m_ackRecoveryPermitWindowStartNs;
+		qp->m_ackRecoveryProbeStartSeq = packetSeq;
+		qp->m_ackRecoveryProbeEndSeq = packetSeq + payload_size;
+		qp->m_ackRecoveryAttempts++;
+		qp->m_ackRecoveryProbeCount++;
+
+		std::cout << "[RNIC ACK RECOVERY PROBE TX]"
+		          << " t_ns=" << Simulator::Now().GetNanoSeconds()
+		          << " node=" << m_node->GetId()
+		          << " src=" << qp->m_src
+		          << " dst=" << qp->m_dest
+		          << " sport=" << qp->sport
+		          << " plane="
+		          << (qp->m_hasBoundRnicPort
+		                  ? static_cast<int64_t>(qp->m_boundPlaneId)
+		                  : -1)
+		          << " rnic_port="
+		          << (qp->m_hasBoundRnicPort
+		                  ? static_cast<int64_t>(qp->m_boundRnicPort)
+		                  : -1)
+		          << " window_start_ns="
+		          << qp->m_ackRecoveryLastProbeWindowStartNs
+		          << " seq=" << packetSeq
+		          << " end_seq=" << (packetSeq + payload_size)
+		          << " bytes=" << payload_size
+		          << " on_the_fly_before=" << qp->GetOnTheFly()
+		          << " win=" << qp->GetWin()
+		          << " attempt=" << qp->m_ackRecoveryAttempts
+		          << std::endl;
+	}
+
 	// update retransmission accounting before advancing snd_nxt.
 	if (packetSeq < qp->m_highestSentSeq)
 	{
@@ -1305,6 +1498,10 @@ void RdmaHw::PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap)
 		qp->m_deadlineSampleSeq = qp->m_deadlineLastPacketEndSeq;
 		qp->m_deadlineSampleTxNs =
 			static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
+		qp->m_deadlineSampleWindowStartNs =
+			qp->m_deadlineLastAllowedWindowStartNs;
+		qp->m_deadlineSampleWindowEndNs =
+			qp->m_deadlineLastAllowedWindowEndNs;
 	}
 
 	UpdateNextAvail(qp, interframeGap, pkt->GetSize());

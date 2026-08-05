@@ -7,6 +7,8 @@
 #include "ns3/ppp-header.h"
 #include "rdma-queue-pair.h"
 
+// MODE1_CONTINUATION_ACK_RECOVERY_V1: bounded next-window DATA probing.
+
 namespace ns3 {
 
 /**************************
@@ -41,6 +43,11 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_deadlineSampleOutstanding = false;
 	m_deadlineSampleSeq = 0;
 	m_deadlineSampleTxNs = 0;
+	m_deadlineSampleWindowStartNs = 0;
+	m_deadlineSampleWindowEndNs = 0;
+	m_deadlineLastAllowedWindowStartNs = 0;
+	m_deadlineLastAllowedWindowEndNs = 0;
+	m_deadlineRejectedCrossWindowSamples = 0;
 	m_deadlineSrttNs = 0;
 	m_deadlineRttVarNs = 0;
 	m_deadlineValidSamples = 0;
@@ -52,6 +59,25 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_deadlineLastPacketSeq = 0;
 	m_deadlineLastPacketEndSeq = 0;
 	m_deadlineLastPacketWasRetransmission = false;
+	m_ackRecoveryActive = false;
+	m_ackRecoveryPermit = false;
+	m_ackRecoveryProbeInFlight = false;
+	m_ackRecoveryNextWindowStartNs = 0;
+	m_ackRecoveryLastArmWindowEndNs = 0;
+	m_ackRecoveryPermitWindowStartNs = 0;
+	m_ackRecoveryLastProbeWindowStartNs = 0;
+	m_ackRecoveryProbeStartSeq = 0;
+	m_ackRecoveryProbeEndSeq = 0;
+	m_ackRecoveryLastAckProgressNs = 0;
+	m_ackRecoveryLastAckProgressSeq = 0;
+	m_ackRecoveryAttempts = 0;
+	m_ackRecoveryArmCount = 0;
+	m_ackRecoveryProbeCount = 0;
+	m_ackRecoverySuccessCount = 0;
+	m_ackRecoveryDelayedAckCount = 0;
+	m_ackRecoveryNackCount = 0;
+	m_ackRecoveryExhaustedCount = 0;
+	m_ackRecoveryNoContinuationCount = 0;
 	m_pg = pg;
 	m_ipid = 0;
 	m_win = 0;

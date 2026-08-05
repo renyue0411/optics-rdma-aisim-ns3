@@ -13,6 +13,7 @@
 #include "pint.h"
 
 // MODE2_CQE_SEMANTICS_V1: RNIC keeps signaled-WR boundaries internally.
+// MODE1_CONTINUATION_ACK_RECOVERY_V1: bounded next-window DATA probing.
 
 namespace ns3 {
 
@@ -90,6 +91,11 @@ public:
 	uint64_t m_rnicDeadlineInitialGuardNs;
 	uint32_t m_rnicDeadlineMinRttSamples;
 	uint32_t m_rnicDeadlineRttVarMultiplier;
+
+	// Mode-1 continuation recovery has one external enable switch.  Packet
+	// size is the configured MTU and the attempt bound is an RNIC constant.
+	bool m_rnicAckRecoveryEnabled;
+
 	uint32_t m_gpus_per_server; // uesed for routing; if src and dst in the same server, then communicate by nvswitch.
 	uint32_t nvls_enable;
 	std::set<uint32_t> nvswitch_set;
@@ -190,7 +196,14 @@ public:
 	bool IsRnicDeadlineEnabled() const;
 	uint64_t GetRnicDeadlineReserveNs(Ptr<RdmaQueuePair> qp) const;
 	void UpdateRnicDeadlineRtt(Ptr<RdmaQueuePair> qp, uint64_t ackSeq);
-	void InvalidateRnicDeadlineSample(Ptr<RdmaQueuePair> qp); // setup shared data and callbacks with the QbbNetDevice
+	void InvalidateRnicDeadlineSample(Ptr<RdmaQueuePair> qp);
+	void ConfigureRnicAckRecovery(bool enabled);
+	bool IsRnicAckRecoveryEnabled() const;
+	uint32_t GetRnicAckRecoveryMaxAttempts() const;
+	void ResetRnicAckRecoveryState(Ptr<RdmaQueuePair> qp);
+	void HandleRnicAckRecoveryProgress(Ptr<RdmaQueuePair> qp,
+	                                   uint64_t oldUna,
+	                                   uint64_t ackSeq); // setup shared data and callbacks with the QbbNetDevice
 	static uint64_t GetQpKey(uint32_t dip, uint16_t sport, uint16_t pg); // get the lookup key for m_qpMap
 	Ptr<RdmaQueuePair> GetQp(uint32_t dip, uint16_t sport, uint16_t pg); // get the qp
 	uint32_t GetNicIdxOfQp(Ptr<RdmaQueuePair> qp); // get the NIC index of the qp

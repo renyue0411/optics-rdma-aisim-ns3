@@ -16,6 +16,7 @@
 // MODE2_PER_PORT_TIMING_V1: isolate Mode-2 rate/CQE state by breakout RNIC port.
 // MODE2_PER_PORT_AGGREGATE_ADMISSION_V1: account all in-flight WR bytes per breakout port.
 // MODE2_PORT_QP_LOGGING_V1: separate configured QP hint from runtime per-port QP count.
+// MODE1_CONTINUATION_ACK_RECOVERY_V1: bounded next-window DATA probing.
 
 namespace ns3 {
 
@@ -551,6 +552,13 @@ RdmaTransport::RnicGateAllowsQp(Ptr<RdmaQueuePair> qp) const
 
     const Time now = Simulator::Now();
     const GateLookupResult gate = LookupGate(qp, now);
+    if (qp != NULL)
+    {
+        // A permit is consumed only by GetNxtPacket().  Recompute it for each
+        // scheduler eligibility check so a delayed ACK can cancel the bypass.
+        qp->m_ackRecoveryPermit = false;
+    }
+
     if (gate.bypass)
     {
         return true;
@@ -559,76 +567,104 @@ RdmaTransport::RnicGateAllowsQp(Ptr<RdmaQueuePair> qp) const
     {
         return false;
     }
-    if (m_rdma == NULL || !m_rdma->IsRnicDeadlineEnabled())
-    {
-        return true;
-    }
 
-    const Time candidateTx = std::max(now, qp->m_nextAvail);
-    const uint64_t reserveNs = m_rdma->GetRnicDeadlineReserveNs(qp);
-    const uint64_t candidateNs =
-        static_cast<uint64_t>(candidateTx.GetNanoSeconds());
-    const uint64_t windowEndNs =
+    bool deadlineAllows = true;
+    uint64_t reserveNs = 0;
+    uint64_t candidateNs = 0;
+    uint64_t windowEndNs =
         static_cast<uint64_t>(gate.currentWindowEnd.GetNanoSeconds());
 
-    const bool deadlineAllows =
-        candidateNs <= windowEndNs &&
-        reserveNs <= windowEndNs - candidateNs;
-
-    qp->m_deadlineCheckCount++;
-    if (deadlineAllows)
+    if (m_rdma != NULL && m_rdma->IsRnicDeadlineEnabled())
     {
-        qp->m_deadlineAllowedCheckCount++;
+        const Time candidateTx = std::max(now, qp->m_nextAvail);
+        reserveNs = m_rdma->GetRnicDeadlineReserveNs(qp);
+        candidateNs =
+            static_cast<uint64_t>(candidateTx.GetNanoSeconds());
+
+        deadlineAllows =
+            candidateNs <= windowEndNs &&
+            reserveNs <= windowEndNs - candidateNs;
+
+        qp->m_deadlineCheckCount++;
+        if (deadlineAllows)
+        {
+            qp->m_deadlineAllowedCheckCount++;
+        }
+        else
+        {
+            qp->m_deadlineBlockedCheckCount++;
+
+            // Count and log only once per physical window. The scheduler may
+            // ask the same QP repeatedly after the ACK-safe cutoff.
+            if (qp->m_deadlineLastBlockedWindowEndNs != windowEndNs)
+            {
+                qp->m_deadlineLastBlockedWindowEndNs = windowEndNs;
+                qp->m_deadlineBlockEventCount++;
+
+                const uint64_t cutoffNs =
+                    reserveNs <= windowEndNs ? windowEndNs - reserveNs : 0;
+                const Time nextWindow = GetNextPhysicalWindowStart(qp, gate);
+                const int64_t nextWindowSignedNs = nextWindow.GetNanoSeconds();
+                const uint64_t nextWindowNs =
+                    nextWindowSignedNs > 0
+                        ? static_cast<uint64_t>(nextWindowSignedNs)
+                        : 0;
+
+                std::cout
+                    << "[RNIC DEADLINE BLOCK]"
+                    << " t_ns=" << now.GetNanoSeconds()
+                    << " node="
+                    << (m_node != NULL
+                            ? static_cast<int64_t>(m_node->GetId())
+                            : -1)
+                    << " src=" << qp->m_src
+                    << " dst=" << qp->m_dest
+                    << " sport=" << qp->sport
+                    << " plane="
+                    << (qp->m_hasBoundRnicPort
+                            ? static_cast<int64_t>(qp->m_boundPlaneId)
+                            : -1)
+                    << " rnic_port="
+                    << (qp->m_hasBoundRnicPort
+                            ? static_cast<int64_t>(qp->m_boundRnicPort)
+                            : -1)
+                    << " candidate_tx_ns=" << candidateNs
+                    << " stable_end_ns=" << windowEndNs
+                    << " cutoff_ns=" << cutoffNs
+                    << " reserve_ns=" << reserveNs
+                    << " next_window_start_ns=" << nextWindowNs
+                    << " samples=" << qp->m_deadlineValidSamples
+                    << " srtt_ns=" << qp->m_deadlineSrttNs
+                    << " rttvar_ns=" << qp->m_deadlineRttVarNs
+                    << " block_events=" << qp->m_deadlineBlockEventCount
+                    << std::endl;
+            }
+
+            ArmRnicAckRecovery(qp, gate, "deadline");
+            return false;
+        }
+    }
+
+    if (!qp->IsWinBound())
+    {
+        qp->m_deadlineLastAllowedWindowStartNs =
+            static_cast<uint64_t>(gate.currentWindowStart.GetNanoSeconds());
+        qp->m_deadlineLastAllowedWindowEndNs = windowEndNs;
         return true;
     }
 
-    qp->m_deadlineBlockedCheckCount++;
-
-    // Count and log only once per physical window. The scheduler may ask the
-    // same QP repeatedly after the ACK-safe cutoff but before circuit close.
-    if (qp->m_deadlineLastBlockedWindowEndNs != windowEndNs)
+    if (CanSendRnicContinuationProbe(qp, gate, now))
     {
-        qp->m_deadlineLastBlockedWindowEndNs = windowEndNs;
-        qp->m_deadlineBlockEventCount++;
-
-        const uint64_t cutoffNs =
-            reserveNs <= windowEndNs ? windowEndNs - reserveNs : 0;
-        const Time nextWindow =
-            LookupGate(qp, gate.currentWindowEnd).nextAllowedTime;
-        const int64_t nextWindowSignedNs = nextWindow.GetNanoSeconds();
-        const uint64_t nextWindowNs =
-            nextWindowSignedNs > 0
-                ? static_cast<uint64_t>(nextWindowSignedNs)
-                : 0;
-
-        std::cout
-            << "[RNIC DEADLINE BLOCK]"
-            << " t_ns=" << now.GetNanoSeconds()
-            << " node="
-            << (m_node != NULL ? static_cast<int64_t>(m_node->GetId()) : -1)
-            << " src=" << qp->m_src
-            << " dst=" << qp->m_dest
-            << " sport=" << qp->sport
-            << " plane="
-            << (qp->m_hasBoundRnicPort
-                    ? static_cast<int64_t>(qp->m_boundPlaneId)
-                    : -1)
-            << " rnic_port="
-            << (qp->m_hasBoundRnicPort
-                    ? static_cast<int64_t>(qp->m_boundRnicPort)
-                    : -1)
-            << " candidate_tx_ns=" << candidateNs
-            << " stable_end_ns=" << windowEndNs
-            << " cutoff_ns=" << cutoffNs
-            << " reserve_ns=" << reserveNs
-            << " next_window_start_ns=" << nextWindowNs
-            << " samples=" << qp->m_deadlineValidSamples
-            << " srtt_ns=" << qp->m_deadlineSrttNs
-            << " rttvar_ns=" << qp->m_deadlineRttVarNs
-            << " block_events=" << qp->m_deadlineBlockEventCount
-            << std::endl;
+        qp->m_deadlineLastAllowedWindowStartNs =
+            static_cast<uint64_t>(gate.currentWindowStart.GetNanoSeconds());
+        qp->m_deadlineLastAllowedWindowEndNs = windowEndNs;
+        return true;
     }
 
+    // The transport window is full.  Do not spin inside the current window;
+    // schedule exactly one bounded continuation opportunity at the next
+    // physical window for this destination.
+    ArmRnicAckRecovery(qp, gate, "window_bound");
     return false;
 }
 
@@ -646,27 +682,215 @@ RdmaTransport::GetNextRnicGateTime(Ptr<RdmaQueuePair> qp) const
     {
         return gate.nextAllowedTime;
     }
-    if (m_rdma == NULL || !m_rdma->IsRnicDeadlineEnabled())
+
+    if (m_rdma != NULL && m_rdma->IsRnicDeadlineEnabled())
     {
-        return now;
+        const Time candidateTx = std::max(now, qp->m_nextAvail);
+        const uint64_t reserveNs = m_rdma->GetRnicDeadlineReserveNs(qp);
+        const uint64_t candidateNs =
+            static_cast<uint64_t>(candidateTx.GetNanoSeconds());
+        const uint64_t windowEndNs =
+            static_cast<uint64_t>(gate.currentWindowEnd.GetNanoSeconds());
+
+        if (!(candidateNs <= windowEndNs &&
+              reserveNs <= windowEndNs - candidateNs))
+        {
+            return GetNextPhysicalWindowStart(qp, gate);
+        }
     }
 
-    const Time candidateTx = std::max(now, qp->m_nextAvail);
-    const uint64_t reserveNs = m_rdma->GetRnicDeadlineReserveNs(qp);
-    const uint64_t candidateNs =
-        static_cast<uint64_t>(candidateTx.GetNanoSeconds());
+    if (qp != NULL && qp->IsWinBound())
+    {
+        if (m_rdma != NULL && m_rdma->IsRnicAckRecoveryEnabled() &&
+            qp->m_ackRecoveryActive &&
+            qp->m_ackRecoveryNextWindowStartNs >
+                static_cast<uint64_t>(now.GetNanoSeconds()))
+        {
+            return NanoSeconds(qp->m_ackRecoveryNextWindowStartNs);
+        }
+        // No timer is required for an ordinary transport-window stall.  A
+        // cumulative ACK/NACK will call TriggerTransmit().
+        return Simulator::GetMaximumSimulationTime();
+    }
+
+    return now;
+}
+
+Time
+RdmaTransport::GetNextPhysicalWindowStart(
+    Ptr<RdmaQueuePair> qp,
+    const GateLookupResult& gate) const
+{
+    if (gate.bypass)
+    {
+        return Simulator::Now();
+    }
+    return LookupGate(qp, gate.currentWindowEnd).nextAllowedTime;
+}
+
+void
+RdmaTransport::ArmRnicAckRecovery(
+    Ptr<RdmaQueuePair> qp,
+    const GateLookupResult& gate,
+    const char* reason) const
+{
+    if (m_rdma == NULL || !m_rdma->IsRnicAckRecoveryEnabled() ||
+        qp == NULL || gate.bypass || !gate.allowed ||
+        qp->snd_una >= qp->snd_nxt)
+    {
+        return;
+    }
+
     const uint64_t windowEndNs =
         static_cast<uint64_t>(gate.currentWindowEnd.GetNanoSeconds());
 
-    if (candidateNs <= windowEndNs &&
-        reserveNs <= windowEndNs - candidateNs)
+    if (qp->GetBytesLeft() == 0)
     {
-        return now;
+        if (qp->m_ackRecoveryLastArmWindowEndNs != windowEndNs)
+        {
+            qp->m_ackRecoveryLastArmWindowEndNs = windowEndNs;
+            qp->m_ackRecoveryNoContinuationCount++;
+            std::cout << "[RNIC ACK RECOVERY NO CONTINUATION]"
+                      << " t_ns=" << Simulator::Now().GetNanoSeconds()
+                      << " node="
+                      << (m_node != NULL
+                              ? static_cast<int64_t>(m_node->GetId())
+                              : -1)
+                      << " src=" << qp->m_src
+                      << " dst=" << qp->m_dest
+                      << " sport=" << qp->sport
+                      << " snd_una=" << qp->snd_una
+                      << " snd_nxt=" << qp->snd_nxt
+                      << " reason=" << reason
+                      << std::endl;
+        }
+        return;
     }
 
-    // The physical circuit is still open, but its ACK-safe portion has ended.
-    // Wake at the next physical window for this destination, not immediately.
-    return LookupGate(qp, gate.currentWindowEnd).nextAllowedTime;
+    if (qp->m_ackRecoveryAttempts >=
+        m_rdma->GetRnicAckRecoveryMaxAttempts())
+    {
+        // Keep the final probe active so a late ACK can still complete it,
+        // but schedule no further continuation opportunity.
+        if (qp->m_ackRecoveryNextWindowStartNs != 0)
+        {
+            qp->m_ackRecoveryExhaustedCount++;
+            std::cout << "[RNIC ACK RECOVERY EXHAUSTED]"
+                      << " t_ns=" << Simulator::Now().GetNanoSeconds()
+                      << " node="
+                      << (m_node != NULL
+                              ? static_cast<int64_t>(m_node->GetId())
+                              : -1)
+                      << " src=" << qp->m_src
+                      << " dst=" << qp->m_dest
+                      << " sport=" << qp->sport
+                      << " attempts=" << qp->m_ackRecoveryAttempts
+                      << " snd_una=" << qp->snd_una
+                      << " snd_nxt=" << qp->snd_nxt
+                      << std::endl;
+        }
+        qp->m_ackRecoveryPermit = false;
+        qp->m_ackRecoveryNextWindowStartNs = 0;
+        return;
+    }
+
+    const Time nextWindow = GetNextPhysicalWindowStart(qp, gate);
+    if (nextWindow == Simulator::GetMaximumSimulationTime())
+    {
+        return;
+    }
+
+    const int64_t nextSignedNs = nextWindow.GetNanoSeconds();
+    if (nextSignedNs < 0)
+    {
+        return;
+    }
+    const uint64_t nextWindowNs = static_cast<uint64_t>(nextSignedNs);
+
+    if (qp->m_ackRecoveryLastArmWindowEndNs == windowEndNs &&
+        qp->m_ackRecoveryNextWindowStartNs == nextWindowNs)
+    {
+        return;
+    }
+
+    qp->m_ackRecoveryActive = true;
+    qp->m_ackRecoveryPermit = false;
+    qp->m_ackRecoveryNextWindowStartNs = nextWindowNs;
+    qp->m_ackRecoveryLastArmWindowEndNs = windowEndNs;
+    qp->m_ackRecoveryArmCount++;
+
+    std::cout << "[RNIC ACK RECOVERY ARM]"
+              << " t_ns=" << Simulator::Now().GetNanoSeconds()
+              << " node="
+              << (m_node != NULL ? static_cast<int64_t>(m_node->GetId()) : -1)
+              << " src=" << qp->m_src
+              << " dst=" << qp->m_dest
+              << " sport=" << qp->sport
+              << " plane="
+              << (qp->m_hasBoundRnicPort
+                      ? static_cast<int64_t>(qp->m_boundPlaneId)
+                      : -1)
+              << " rnic_port="
+              << (qp->m_hasBoundRnicPort
+                      ? static_cast<int64_t>(qp->m_boundRnicPort)
+                      : -1)
+              << " source_window_start_ns="
+              << gate.currentWindowStart.GetNanoSeconds()
+              << " source_window_end_ns=" << windowEndNs
+              << " next_window_start_ns=" << nextWindowNs
+              << " snd_una=" << qp->snd_una
+              << " snd_nxt=" << qp->snd_nxt
+              << " on_the_fly=" << qp->GetOnTheFly()
+              << " win=" << qp->GetWin()
+              << " reason=" << reason
+              << std::endl;
+}
+
+bool
+RdmaTransport::CanSendRnicContinuationProbe(
+    Ptr<RdmaQueuePair> qp,
+    const GateLookupResult& gate,
+    Time now) const
+{
+    if (m_rdma == NULL || !m_rdma->IsRnicAckRecoveryEnabled() ||
+        qp == NULL || !qp->m_ackRecoveryActive ||
+        qp->snd_una >= qp->snd_nxt || qp->GetBytesLeft() == 0)
+    {
+        return false;
+    }
+
+    if (qp->m_ackRecoveryAttempts >=
+        m_rdma->GetRnicAckRecoveryMaxAttempts())
+    {
+        ArmRnicAckRecovery(qp, gate, "attempt_limit");
+        return false;
+    }
+
+    const uint64_t windowStartNs =
+        static_cast<uint64_t>(gate.currentWindowStart.GetNanoSeconds());
+    const uint64_t nowNs = static_cast<uint64_t>(now.GetNanoSeconds());
+
+    if (windowStartNs < qp->m_ackRecoveryNextWindowStartNs ||
+        nowNs < qp->m_ackRecoveryNextWindowStartNs ||
+        qp->m_ackRecoveryLastProbeWindowStartNs == windowStartNs)
+    {
+        // If this window already carried a probe, arm the next one before
+        // returning false so the egress queue sleeps rather than spins.
+        if (qp->m_ackRecoveryLastProbeWindowStartNs == windowStartNs)
+        {
+            ArmRnicAckRecovery(qp, gate, "probe_already_sent");
+        }
+        return false;
+    }
+
+    // Any outstanding timestamp predates this recovery window and would
+    // include the schedule gap.  Drop it so the continuation packet can
+    // provide a fresh, same-window DATA-to-ACK RTT sample.
+    m_rdma->InvalidateRnicDeadlineSample(qp);
+
+    qp->m_ackRecoveryPermit = true;
+    qp->m_ackRecoveryPermitWindowStartNs = windowStartNs;
+    return true;
 }
 
 RdmaTransport::GateLookupResult
@@ -675,6 +899,7 @@ RdmaTransport::LookupGate(
     Time now) const
 {
     GateLookupResult result;
+    result.currentWindowStart = now;
     result.currentWindowEnd = now;
     result.nextAllowedTime = Simulator::GetMaximumSimulationTime();
 
@@ -682,6 +907,7 @@ RdmaTransport::LookupGate(
     {
         result.bypass = true;
         result.allowed = true;
+        result.currentWindowStart = now;
         result.currentWindowEnd = Simulator::GetMaximumSimulationTime();
         result.nextAllowedTime = now;
         return result;
@@ -718,7 +944,10 @@ RdmaTransport::LookupGate(
         if (offsetNs >= slot.startOffsetNs && offsetNs < slot.endOffsetNs)
         {
             result.allowed = true;
-            result.currentWindowEnd = NanoSeconds(periodBaseNs + slot.endOffsetNs);
+            result.currentWindowStart =
+                NanoSeconds(periodBaseNs + slot.startOffsetNs);
+            result.currentWindowEnd =
+                NanoSeconds(periodBaseNs + slot.endOffsetNs);
             result.nextAllowedTime = now;
             return result;
         }
