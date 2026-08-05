@@ -19,6 +19,8 @@
 #include <iostream>	// debug
 #include <limits>
 
+// MODE2_CQE_SEMANTICS_V1: complete WR boundaries generate CQE callbacks.
+
 namespace ns3{
 
 const uint64_t RdmaHw::FLOW_RX_BUCKET_NS;
@@ -268,6 +270,12 @@ TypeId RdmaHw::GetTypeId (void)
 
 RdmaHw::RdmaHw(){
 	m_scaleOutPlaneScheduler = SCALE_OUT_HASH;
+	m_rnicDeadlineEnabled = false;
+	m_rnicDeadlinePipelineGuardNs = 0;
+	m_rnicDeadlineClockGuardNs = 0;
+	m_rnicDeadlineInitialGuardNs = 0;
+	m_rnicDeadlineMinRttSamples = 4;
+	m_rnicDeadlineRttVarMultiplier = 4;
 }
 
 void RdmaHw::enable_nvls() {
@@ -415,6 +423,47 @@ void RdmaHw::SetQpRecoverCallback(QpRecoverCallback cb){
 	m_qpRecoverCallback = cb;
 }
 
+void RdmaHw::SetWrCompletionCallback(WrCompletionCallback cb){
+    m_wrCompletionCallback = cb;
+}
+
+void RdmaHw::GenerateWrCompletions(Ptr<RdmaQueuePair> qp){
+    if (qp == NULL){
+        return;
+    }
+
+    const uint64_t key = GetQpKey(qp->dip.Get(), qp->sport, qp->m_pg);
+    std::map<uint64_t, std::deque<PostedWrRecord> >::iterator it =
+        m_postedWrRecords.find(key);
+    if (it == m_postedWrRecords.end()){
+        return;
+    }
+
+    std::deque<PostedWrRecord>& records = it->second;
+    const uint64_t completionTimeNs =
+        static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
+
+    while (!records.empty() && records.front().endSeq <= qp->snd_una){
+        const PostedWrRecord record = records.front();
+        records.pop_front();
+        if (!m_wrCompletionCallback.IsNull()){
+            m_wrCompletionCallback(
+                qp,
+                record.wrId,
+                record.bytes,
+                record.postTimeNs,
+                completionTimeNs);
+        }
+    }
+
+    if (records.empty()){
+        m_postedWrRecords.erase(it);
+        if (qp->IsFinished()){
+            m_nextWrId.erase(key);
+        }
+    }
+}
+
 void RdmaHw::SetRnicGateCallbacks(RnicGateAllowCallback allowCb,
                                       RnicGateNextTimeCallback nextTimeCb){
 	m_rnicGateAllowCallback = allowCb;
@@ -424,6 +473,98 @@ void RdmaHw::SetRnicGateCallbacks(RnicGateAllowCallback allowCb,
 void RdmaHw::ClearRnicGateCallbacks(){
 	m_rnicGateAllowCallback = RnicGateAllowCallback();
 	m_rnicGateNextTimeCallback = RnicGateNextTimeCallback();
+}
+
+void RdmaHw::ConfigureRnicDeadline(bool enabled,
+                                      uint64_t pipelineGuardNs,
+                                      uint64_t clockGuardNs,
+                                      uint64_t initialGuardNs,
+                                      uint32_t minRttSamples,
+                                      uint32_t rttVarMultiplier){
+	m_rnicDeadlineEnabled = enabled;
+	m_rnicDeadlinePipelineGuardNs = pipelineGuardNs;
+	m_rnicDeadlineClockGuardNs = clockGuardNs;
+	m_rnicDeadlineInitialGuardNs = initialGuardNs;
+	m_rnicDeadlineMinRttSamples = std::max<uint32_t>(1, minRttSamples);
+	m_rnicDeadlineRttVarMultiplier = std::max<uint32_t>(1, rttVarMultiplier);
+
+	if (m_rnicDeadlineEnabled){
+		std::cout << "[RNIC DEADLINE CONFIG]"
+		          << " node=" << (m_node != NULL ? static_cast<int64_t>(m_node->GetId()) : -1)
+		          << " pipeline_guard_ns=" << m_rnicDeadlinePipelineGuardNs
+		          << " clock_guard_ns=" << m_rnicDeadlineClockGuardNs
+		          << " initial_guard_ns=" << m_rnicDeadlineInitialGuardNs
+		          << " min_rtt_samples=" << m_rnicDeadlineMinRttSamples
+		          << " rttvar_multiplier=" << m_rnicDeadlineRttVarMultiplier
+		          << std::endl;
+	}
+}
+
+bool RdmaHw::IsRnicDeadlineEnabled() const{
+	return m_rnicDeadlineEnabled;
+}
+
+uint64_t RdmaHw::GetRnicDeadlineReserveNs(Ptr<RdmaQueuePair> qp) const{
+	if (!m_rnicDeadlineEnabled || qp == NULL){
+		return 0;
+	}
+
+	uint64_t rttBoundNs;
+	if (qp->m_deadlineValidSamples < m_rnicDeadlineMinRttSamples){
+		rttBoundNs = qp->m_baseRtt + m_rnicDeadlineInitialGuardNs;
+	}else{
+		const uint64_t multiplier =
+			static_cast<uint64_t>(m_rnicDeadlineRttVarMultiplier);
+		const uint64_t variationReserve =
+			qp->m_deadlineRttVarNs >
+				std::numeric_limits<uint64_t>::max() / multiplier
+				? std::numeric_limits<uint64_t>::max()
+				: qp->m_deadlineRttVarNs * multiplier;
+		rttBoundNs = variationReserve >
+			std::numeric_limits<uint64_t>::max() - qp->m_deadlineSrttNs
+			? std::numeric_limits<uint64_t>::max()
+			: qp->m_deadlineSrttNs + variationReserve;
+	}
+
+	return rttBoundNs +
+		m_rnicDeadlinePipelineGuardNs +
+		m_rnicDeadlineClockGuardNs;
+}
+
+void RdmaHw::UpdateRnicDeadlineRtt(Ptr<RdmaQueuePair> qp, uint64_t ackSeq){
+	if (!m_rnicDeadlineEnabled || qp == NULL ||
+		!qp->m_deadlineSampleOutstanding ||
+		ackSeq < qp->m_deadlineSampleSeq){
+		return;
+	}
+
+	const uint64_t nowNs =
+		static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
+	if (nowNs >= qp->m_deadlineSampleTxNs){
+		const uint64_t sampleNs = nowNs - qp->m_deadlineSampleTxNs;
+		if (qp->m_deadlineValidSamples == 0){
+			qp->m_deadlineSrttNs = sampleNs;
+			qp->m_deadlineRttVarNs = sampleNs / 2;
+		}else{
+			const uint64_t deviation =
+				qp->m_deadlineSrttNs > sampleNs
+					? qp->m_deadlineSrttNs - sampleNs
+					: sampleNs - qp->m_deadlineSrttNs;
+			qp->m_deadlineRttVarNs =
+				(3 * qp->m_deadlineRttVarNs + deviation) / 4;
+			qp->m_deadlineSrttNs =
+				(7 * qp->m_deadlineSrttNs + sampleNs) / 8;
+		}
+		qp->m_deadlineValidSamples++;
+	}
+
+	qp->m_deadlineSampleOutstanding = false;
+}
+
+void RdmaHw::InvalidateRnicDeadlineSample(Ptr<RdmaQueuePair> qp){
+	if (qp != NULL){
+		qp->m_deadlineSampleOutstanding = false;
+	}
 }
 
 bool RdmaHw::RnicGateAllowsQp(Ptr<RdmaQueuePair> qp) const{
@@ -662,6 +803,15 @@ void RdmaHw::PostWork(Ptr<RdmaQueuePair> qp, uint64_t bytes){
 		return;
 	}
 
+    const uint64_t qpKey = GetQpKey(qp->dip.Get(), qp->sport, qp->m_pg);
+    PostedWrRecord record;
+    record.wrId = ++m_nextWrId[qpKey];
+    record.endSeq = newLimit;
+    record.bytes = newLimit - oldLimit;
+    record.postTimeNs =
+        static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
+    m_postedWrRecords[qpKey].push_back(record);
+
 	NS_ASSERT(qp->snd_una <= qp->snd_nxt);
 	NS_ASSERT(qp->snd_nxt <= qp->GetPostedLimit());
 	NS_ASSERT(qp->GetPostedLimit() <= qp->m_size);
@@ -763,6 +913,7 @@ int RdmaHw::SendPacketComplete(Ptr<Packet> p, CustomHeader &ch)
 	uint32_t nic_idx = GetNicIdxOfQp(qp);
 	Ptr<QbbNetDevice> dev = m_nic[nic_idx].dev;
 	SendComplete(qp);
+	return 0;
 }
 
 void RdmaHw::SendComplete(Ptr<RdmaQueuePair> qp)
@@ -899,15 +1050,15 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 	if (m_ack_interval == 0)
 		std::cout << "ERROR: shouldn't receive ack\n";
 	else {
-		if (!m_backto0){
-			qp->Acknowledge(seq);
-		}else {
-			uint64_t goback_seq = seq / m_chunk * m_chunk;
-			qp->Acknowledge(goback_seq);
+		const uint64_t effectiveAckSeq =
+			m_backto0 ? (seq / m_chunk * m_chunk) : seq;
+		if (ch.l3Prot == 0xFC){
+			UpdateRnicDeadlineRtt(qp, effectiveAckSeq);
 		}
-		if (ch.l3Prot == 0xFC && !m_qpProgressCallback.IsNull()){
-			m_qpProgressCallback(qp);
-		}
+		qp->Acknowledge(effectiveAckSeq);
+		if (ch.l3Prot == 0xFC){
+		GenerateWrCompletions(qp);
+	}
 		if (qp->IsFinished()){
 			QpComplete(qp);
 		}
@@ -1003,9 +1154,7 @@ uint16_t RdmaHw::EtherToPpp (uint16_t proto){
 }
 
 void RdmaHw::RecoverQueue(Ptr<RdmaQueuePair> qp){
-	if (!m_qpRecoverCallback.IsNull()){
-		m_qpRecoverCallback(qp);
-	}
+	InvalidateRnicDeadlineSample(qp);
 	qp->snd_nxt = qp->snd_una;
 }
 
@@ -1024,6 +1173,16 @@ void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
 	          << " retrans_bytes=" << qp->m_retransBytes
 	          << " nack_count=" << qp->m_nackCount
 	          << " timeout_count=" << qp->m_timeoutCount
+	          << " deadline_samples=" << qp->m_deadlineValidSamples
+	          << " deadline_srtt_ns=" << qp->m_deadlineSrttNs
+	          << " deadline_rttvar_ns=" << qp->m_deadlineRttVarNs
+	          << " deadline_reserve_ns=" << GetRnicDeadlineReserveNs(qp)
+	          << " deadline_checks=" << qp->m_deadlineCheckCount
+	          << " deadline_allowed_checks=" << qp->m_deadlineAllowedCheckCount
+	          << " deadline_blocked_checks=" << qp->m_deadlineBlockedCheckCount
+	          << " deadline_block_events=" << qp->m_deadlineBlockEventCount
+	          << " deadline_last_blocked_window_end_ns="
+	          << qp->m_deadlineLastBlockedWindowEndNs
 	          << std::endl;
 	if (m_cc_mode == 1){
 		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
@@ -1109,8 +1268,15 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	ppp.SetProtocol (0x0021); // EtherToPpp(0x800), see point-to-point-net-device.cc
 	p->AddHeader (ppp);
 
-	// update retransmission accounting before advancing snd_nxt.
+	// Record whether this generated packet is a first transmission. PktSent()
+	// uses this metadata at the actual RNIC transmission point.
 	const uint64_t packetSeq = qp->snd_nxt;
+	qp->m_deadlineLastPacketSeq = packetSeq;
+	qp->m_deadlineLastPacketEndSeq = packetSeq + payload_size;
+	qp->m_deadlineLastPacketWasRetransmission =
+		(packetSeq < qp->m_highestSentSeq);
+
+	// update retransmission accounting before advancing snd_nxt.
 	if (packetSeq < qp->m_highestSentSeq)
 	{
 		qp->m_retransPackets++;
@@ -1131,6 +1297,16 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 
 void RdmaHw::PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap){
 	qp->lastPktSize = pkt->GetSize();
+
+	if (m_rnicDeadlineEnabled &&
+		!qp->m_deadlineSampleOutstanding &&
+		!qp->m_deadlineLastPacketWasRetransmission){
+		qp->m_deadlineSampleOutstanding = true;
+		qp->m_deadlineSampleSeq = qp->m_deadlineLastPacketEndSeq;
+		qp->m_deadlineSampleTxNs =
+			static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
+	}
+
 	UpdateNextAvail(qp, interframeGap, pkt->GetSize());
 }
 

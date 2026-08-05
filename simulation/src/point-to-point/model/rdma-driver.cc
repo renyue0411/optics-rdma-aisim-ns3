@@ -1,5 +1,7 @@
 #include "rdma-driver.h"
 
+// MODE2_CQE_SEMANTICS_V1: bind userspace to WR completions, not ACK progress.
+
 namespace ns3 {
 
 /***********************
@@ -59,8 +61,9 @@ void RdmaDriver::Init(void){
 	m_transport = CreateObject<RdmaTransport>();
 	m_transport->SetNode(m_node);
 	m_transport->SetRdmaHw(m_rdma);
-	m_rdma->SetQpProgressCallback(MakeCallback(&RdmaTransport::NotifyAckProgress, m_transport));
-	m_rdma->SetQpRecoverCallback(MakeCallback(&RdmaTransport::NotifyRecover, m_transport));
+	// Equivalent to a dedicated userspace CQ busy-poll loop.
+	m_rdma->SetWrCompletionCallback(
+		MakeCallback(&RdmaTransport::NotifyWrCompletion, m_transport));
 }
 
 void RdmaDriver::SetNode(Ptr<Node> node){
@@ -89,8 +92,14 @@ void RdmaDriver::DisableNVLS() {
 	m_rdma->disable_nvls();
 }
 
-void RdmaDriver::QpComplete(Ptr<RdmaQueuePair> q){
-	m_traceQpComplete(q);
+void RdmaDriver::QpComplete(Ptr<RdmaQueuePair> q)
+{
+    if (m_transport != NULL)
+    {
+        m_transport->NotifyQpComplete(q);
+    }
+
+    m_traceQpComplete(q);
 }
 
 void RdmaDriver::SendComplete(Ptr<RdmaQueuePair> q){

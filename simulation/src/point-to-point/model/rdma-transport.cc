@@ -9,6 +9,14 @@
 #include <iostream>
 #include <limits>
 
+// MODE2_CQE_SEMANTICS_V1: Mode-2 completion path models signaled WR + CQE.
+// MODE2_DEFAULT_PIPELINE_V1: default Mode 2 can bypass OCS admission and pipeline WRs.
+// MODE2_INJECTION_WINDOW_PIPELINE_V1: OCS window admission preserves multi-WR pipelining.
+// MODE2_OPTIMIZED_GUARD_V1: stable-end + CQE-jitter userspace safety boundary.
+// MODE2_PER_PORT_TIMING_V1: isolate Mode-2 rate/CQE state by breakout RNIC port.
+// MODE2_PER_PORT_AGGREGATE_ADMISSION_V1: account all in-flight WR bytes per breakout port.
+// MODE2_PORT_QP_LOGGING_V1: separate configured QP hint from runtime per-port QP count.
+
 namespace ns3 {
 
 NS_LOG_COMPONENT_DEFINE("RdmaTransport");
@@ -31,11 +39,13 @@ RdmaTransport::RdmaTransport()
       m_mode(MODE_DEFAULT),
       m_enabled(false),
       m_gateEnabled(false),
+      m_userspaceAdmissionMode(USERSPACE_OCS_WINDOWED),
       m_wrChunkBytes(16 * 1024),
       m_maxOutstandingBytes(64 * 1024),
       m_safeRateBps(30000000000ULL),
       m_tailGuardNs(80000),
       m_minPostBytes(8 * 1024),
+      m_userspaceSoftwareGuardNs(5000),
       m_minSafeRateBps(8000000000ULL),
       m_maxSafeRateBps(30000000000ULL),
       m_minTailGuardNs(80000),
@@ -43,11 +53,6 @@ RdmaTransport::RdmaTransport()
       m_minOutstandingBytes(32 * 1024),
       m_maxOutstandingCeilingBytes(256 * 1024),
       m_adaptPeriodNs(30000000),
-      m_lastAdaptNs(0),
-      m_stableAdaptPeriods(0),
-      m_recoverySinceLastAdapt(false),
-      m_ackProgressSinceLastAdapt(false),
-      m_backlogSinceLastAdapt(false),
       m_autoBandwidthConfig(true),
       m_realDeploymentMode(false),
       m_bottleneckRateBps(0),
@@ -79,6 +84,13 @@ RdmaTransport::SetMode(uint32_t mode)
     m_mode = static_cast<GateMode>(mode);
     m_enabled = (m_mode == MODE_USERSPACE);
 
+    // RDMA_TRANSPORT_MODE=2 directly means userspace Injection Window.
+    // No additional userspace sub-mode configuration is required.
+    if (m_mode == MODE_USERSPACE)
+    {
+        m_userspaceAdmissionMode = USERSPACE_OCS_WINDOWED;
+    }
+
     if (m_rdma == NULL)
     {
         return;
@@ -103,10 +115,57 @@ RdmaTransport::GetMode() const
 }
 
 void
+RdmaTransport::SetUserspaceAdmissionMode(uint32_t mode)
+{
+    NS_ASSERT_MSG(
+        mode <= USERSPACE_OCS_WINDOWED,
+        "userspace admission mode must be 0(default pipeline) or 1(OCS windowed)");
+
+    m_userspaceAdmissionMode =
+        static_cast<UserspaceAdmissionMode>(mode);
+
+    if (m_userspaceAdmissionMode == USERSPACE_DEFAULT_PIPELINE)
+    {
+        // A wake event belongs to OCS-window admission.  Do not leave one
+        // armed when returning to the continuously reachable baseline.
+        for (std::map<uint64_t, EventId>::iterator it = m_wakeEvents.begin();
+             it != m_wakeEvents.end();
+             ++it)
+        {
+            if (it->second.IsRunning())
+            {
+                it->second.Cancel();
+            }
+        }
+        m_wakeEvents.clear();
+    }
+    else
+    {
+        ApplyBandwidthNormalizedConfig("set_ocs_windowed");
+    }
+
+    std::cout
+        << "[USERSPACE ADMISSION MODE]"
+        << " mode=" << mode
+        << " policy="
+        << (m_userspaceAdmissionMode == USERSPACE_DEFAULT_PIPELINE
+                ? "default_pipeline"
+                : "ocs_windowed")
+        << std::endl;
+}
+
+RdmaTransport::UserspaceAdmissionMode
+RdmaTransport::GetUserspaceAdmissionMode() const
+{
+    return m_userspaceAdmissionMode;
+}
+
+void
 RdmaTransport::SetEnabled(bool enabled)
 {
     SetMode(enabled ? MODE_USERSPACE : MODE_DEFAULT);
 }
+
 
 void
 RdmaTransport::Configure(
@@ -132,7 +191,27 @@ RdmaTransport::Configure(
         m_maxOutstandingBytes,
         256 * 1024);
 
-    ApplyBandwidthNormalizedConfig("configure");
+    if (m_userspaceAdmissionMode == USERSPACE_OCS_WINDOWED)
+    {
+        ApplyBandwidthNormalizedConfig("configure");
+        return;
+    }
+
+    const uint64_t maxOutstandingWr =
+        (m_maxOutstandingBytes + m_wrChunkBytes - 1) /
+        m_wrChunkBytes;
+
+    std::cout
+        << "[USERSPACE DEFAULT CONFIG]"
+        << " reason=configure"
+        << " wrChunkBytes=" << m_wrChunkBytes
+        << " maxOutstandingBytes=" << m_maxOutstandingBytes
+        << " maxOutstandingWr=" << maxOutstandingWr
+        << " signaling=every_wr"
+        << " gate_lookup=disabled"
+        << " safe_rate=disabled"
+        << " tail_guard=disabled"
+        << std::endl;
 }
 
 
@@ -164,7 +243,10 @@ RdmaTransport::ConfigureBandwidthNormalized(
 
     m_activeQpHint = std::max<uint32_t>(1, activeQpHint);
 
-    ApplyBandwidthNormalizedConfig("explicit_config");
+    if (m_userspaceAdmissionMode == USERSPACE_OCS_WINDOWED)
+    {
+        ApplyBandwidthNormalizedConfig("explicit_config");
+    }
 }
 
 uint64_t
@@ -289,175 +371,117 @@ RdmaTransport::ApplyBandwidthNormalizedConfig(const char* reason)
     {
         bottleneckRateBps = GetLocalBottleneckRateBps();
     }
-
     if (bottleneckRateBps == 0)
     {
         return;
     }
 
     m_bottleneckRateBps = bottleneckRateBps;
-
-    uint64_t effectiveSwitchingGuardNs = m_switchingGuardNs;
-
-    if (effectiveSwitchingGuardNs == 0 && !m_gateTables.empty())
-    {
-        m_switchingGuardNs = InferSwitchingGuardNs();
-        effectiveSwitchingGuardNs = m_switchingGuardNs;
-    }
-
-    if (effectiveSwitchingGuardNs == 0)
-    {
-        effectiveSwitchingGuardNs = 10000ULL;
-    }
-
     if (m_maxObservedRttNs == 0)
     {
         m_maxObservedRttNs = 10000ULL;
     }
 
-    uint32_t activeQps = std::max<uint32_t>(1, m_activeQpHint);
+    const uint32_t activeQps = std::max<uint32_t>(1, m_activeQpHint);
+    const uint64_t safeFactorPermille =
+        m_realDeploymentMode ? 800ULL : 900ULL;
+    const uint64_t minFactorPermille =
+        m_realDeploymentMode ? 400ULL : 500ULL;
+    const uint64_t maxFactorPermille = 950ULL;
 
-    uint64_t safeFactorPermille =
-        m_realDeploymentMode ? 300ULL : 350ULL;
+    const uint64_t oldSafeRateBps = m_safeRateBps;
+    const uint64_t oldTailGuardNs = m_tailGuardNs;
+    const uint64_t oldMaxOutstandingBytes = m_maxOutstandingBytes;
+    const uint64_t oldWrChunkBytes = m_wrChunkBytes;
+    const uint64_t oldMinPostBytes = m_minPostBytes;
 
-    uint64_t minFactorPermille = 200ULL;
-    uint64_t maxFactorPermille = 900ULL;
-
-    uint64_t oldSafeRateBps = m_safeRateBps;
-    uint64_t oldTailGuardNs = m_tailGuardNs;
-    uint64_t oldMaxOutstandingBytes = m_maxOutstandingBytes;
-    uint64_t oldWrChunkBytes = m_wrChunkBytes;
-    uint64_t oldMinPostBytes = m_minPostBytes;
-
-    long double rateBase =
+    const long double rateBase =
         static_cast<long double>(bottleneckRateBps) /
         static_cast<long double>(activeQps);
 
-    uint64_t targetSafeRateBps =
+    const uint64_t targetSafeRateBps =
         static_cast<uint64_t>(
-            rateBase *
-            static_cast<long double>(safeFactorPermille) /
-            1000.0L);
-
-    m_minSafeRateBps =
-        static_cast<uint64_t>(
-            rateBase *
-            static_cast<long double>(minFactorPermille) /
-            1000.0L);
-
-    m_maxSafeRateBps =
-        static_cast<uint64_t>(
-            rateBase *
-            static_cast<long double>(maxFactorPermille) /
-            1000.0L);
-
+            rateBase * static_cast<long double>(safeFactorPermille) / 1000.0L);
     m_minSafeRateBps = std::max<uint64_t>(
-        m_minSafeRateBps,
+        static_cast<uint64_t>(
+            rateBase * static_cast<long double>(minFactorPermille) / 1000.0L),
         1000000000ULL);
-
     m_maxSafeRateBps = std::max<uint64_t>(
-        m_maxSafeRateBps,
+        static_cast<uint64_t>(
+            rateBase * static_cast<long double>(maxFactorPermille) / 1000.0L),
         m_minSafeRateBps);
-
     m_safeRateBps = ClampValue(
         targetSafeRateBps,
         m_minSafeRateBps,
         m_maxSafeRateBps);
 
-    uint64_t bdpBytes =
-        static_cast<uint64_t>(
-            static_cast<long double>(m_safeRateBps) *
-            static_cast<long double>(m_maxObservedRttNs) /
-            8.0L /
-            1000000000.0L);
-
-    uint64_t outstandingTarget = std::max<uint64_t>(
-        16 * 1024,
-        static_cast<uint64_t>(
-            static_cast<long double>(bdpBytes) * 0.5L));
-
-    uint64_t outstandingBytes = RoundUpPowerOfTwo(outstandingTarget);
-
+    // Configure() owns the fixed per-QP SQ/WR pipeline capacity.
     m_minOutstandingBytes = std::min<uint64_t>(
-        32 * 1024,
-        outstandingBytes);
-
-    m_maxOutstandingBytes = ClampValue(
-        outstandingBytes,
         m_minOutstandingBytes,
-        4 * 1024 * 1024);
-
-    uint64_t outstandingCeiling = RoundUpPowerOfTwo(
-        std::max<uint64_t>(
-            m_maxOutstandingBytes,
-            m_maxOutstandingBytes * 4));
-
-    m_maxOutstandingCeilingBytes = ClampValue(
-        outstandingCeiling,
-        m_maxOutstandingBytes,
-        4 * 1024 * 1024);
-
-    m_wrChunkBytes = std::min<uint64_t>(
-        16 * 1024,
         m_maxOutstandingBytes);
+    m_maxOutstandingCeilingBytes = std::max<uint64_t>(
+        m_maxOutstandingCeilingBytes,
+        m_maxOutstandingBytes);
+    m_minPostBytes = std::min<uint64_t>(4 * 1024, m_wrChunkBytes);
 
-    m_minPostBytes = 4 * 1024;
-
-    uint64_t drainNs =
-        static_cast<uint64_t>(
-            static_cast<long double>(m_maxOutstandingBytes) *
-            8.0L *
-            1000000000.0L /
-            static_cast<long double>(m_safeRateBps));
-
-    uint64_t marginNs =
-        m_realDeploymentMode ? 500000ULL : 500000ULL;
-
+    m_userspaceSoftwareGuardNs =
+        m_realDeploymentMode ? 50000ULL : 5000ULL;
     m_minTailGuardNs =
-        m_realDeploymentMode ? 500000ULL : 500000ULL;
-
+        m_realDeploymentMode ? 50000ULL : 10000ULL;
     m_maxTailGuardNs =
-        m_realDeploymentMode ? 3000000ULL : 3000000ULL;
+        m_realDeploymentMode ? 5000000ULL : 1000000ULL;
 
-    uint64_t targetTailGuardNs =
-        effectiveSwitchingGuardNs +
-        m_maxObservedRttNs +
-        drainNs +
-        marginNs;
-
+    // This is only a template for diagnostics before any QP has been bound.
+    // Runtime admission computes RTT_q + 4*RTTVAR_port + software guard.
+    uint64_t templateGuardNs = m_maxObservedRttNs;
+    if (templateGuardNs <=
+        std::numeric_limits<uint64_t>::max() - m_userspaceSoftwareGuardNs)
+    {
+        templateGuardNs += m_userspaceSoftwareGuardNs;
+    }
+    else
+    {
+        templateGuardNs = std::numeric_limits<uint64_t>::max();
+    }
     m_tailGuardNs = ClampValue(
-        targetTailGuardNs,
+        templateGuardNs,
         m_minTailGuardNs,
         m_maxTailGuardNs);
 
-    bool changed =
+    const bool changed =
         oldSafeRateBps != m_safeRateBps ||
         oldTailGuardNs != m_tailGuardNs ||
         oldMaxOutstandingBytes != m_maxOutstandingBytes ||
         oldWrChunkBytes != m_wrChunkBytes ||
         oldMinPostBytes != m_minPostBytes;
 
-    // The transport object is initialized for every RDMA mode, but its
-    // bandwidth/admission diagnostics are meaningful only in userspace mode.
     if (changed && m_enabled)
     {
         std::cout
             << "[USERSPACE BW INIT]"
-            << " reason=" << (reason != 0 ? reason : "unknown")
+            << " reason=" << (reason != NULL ? reason : "unknown")
             << " gate_tables=" << m_gateTables.size()
             << " bottleneckRateBps=" << bottleneckRateBps
-            << " activeQpHint=" << activeQps
+            << " configuredActiveQpHint=" << activeQps
             << " safeFactorPermille=" << safeFactorPermille
             << " minSafeRateBps=" << m_minSafeRateBps
             << " safeRateBps=" << m_safeRateBps
             << " maxSafeRateBps=" << m_maxSafeRateBps
             << " maxObservedRttNs=" << m_maxObservedRttNs
-            << " switchingGuardNs=" << effectiveSwitchingGuardNs
+            << " configuredSwitchingGuardNs=" << m_switchingGuardNs
+            << " switchingGuardAppliedNs=0"
+            << " stableWindowEnd=1"
+            << " stateScope=transport_template"
+            << " cqeSrttNs=0"
+            << " cqeRttvarNs=0"
+            << " softwareGuardNs=" << m_userspaceSoftwareGuardNs
             << " maxOutstandingBytes=" << m_maxOutstandingBytes
             << " maxOutstandingCeilingBytes=" << m_maxOutstandingCeilingBytes
             << " wrChunkBytes=" << m_wrChunkBytes
+            << " pipelineCapacityFixed=1"
             << " minPostBytes=" << m_minPostBytes
             << " tailGuardNs=" << m_tailGuardNs
+            << " guardModel=qp_rtt_plus_4xport_cqe_var_plus_software"
             << " realMode=" << (m_realDeploymentMode ? 1 : 0)
             << std::endl;
     }
@@ -480,10 +504,11 @@ RdmaTransport::InstallGateTable(
     m_gateTables[rnicId] = table;
     m_gateEnabled = !m_gateTables.empty();
     m_adaptPeriodNs = periodNs;
-    m_lastAdaptNs =
-        static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
 
-    ApplyBandwidthNormalizedConfig("enable_gate");
+    if (m_userspaceAdmissionMode == USERSPACE_OCS_WINDOWED)
+    {
+        ApplyBandwidthNormalizedConfig("enable_gate");
+    }
 
     std::cout << "[RDMA TRANSPORT GATE INSTALLED]"
               << " mode=" << static_cast<uint32_t>(m_mode)
@@ -500,6 +525,8 @@ RdmaTransport::ClearGateTables()
 {
     m_gateEnabled = false;
     m_gateTables.clear();
+    m_userspacePortStates.clear();
+    m_userspaceRegisteredQps.clear();
 
     for (std::map<uint64_t, EventId>::iterator it =
              m_wakeEvents.begin();
@@ -521,7 +548,88 @@ RdmaTransport::RnicGateAllowsQp(Ptr<RdmaQueuePair> qp) const
     {
         return true;
     }
-    return Allows(qp, Simulator::Now());
+
+    const Time now = Simulator::Now();
+    const GateLookupResult gate = LookupGate(qp, now);
+    if (gate.bypass)
+    {
+        return true;
+    }
+    if (!gate.allowed)
+    {
+        return false;
+    }
+    if (m_rdma == NULL || !m_rdma->IsRnicDeadlineEnabled())
+    {
+        return true;
+    }
+
+    const Time candidateTx = std::max(now, qp->m_nextAvail);
+    const uint64_t reserveNs = m_rdma->GetRnicDeadlineReserveNs(qp);
+    const uint64_t candidateNs =
+        static_cast<uint64_t>(candidateTx.GetNanoSeconds());
+    const uint64_t windowEndNs =
+        static_cast<uint64_t>(gate.currentWindowEnd.GetNanoSeconds());
+
+    const bool deadlineAllows =
+        candidateNs <= windowEndNs &&
+        reserveNs <= windowEndNs - candidateNs;
+
+    qp->m_deadlineCheckCount++;
+    if (deadlineAllows)
+    {
+        qp->m_deadlineAllowedCheckCount++;
+        return true;
+    }
+
+    qp->m_deadlineBlockedCheckCount++;
+
+    // Count and log only once per physical window. The scheduler may ask the
+    // same QP repeatedly after the ACK-safe cutoff but before circuit close.
+    if (qp->m_deadlineLastBlockedWindowEndNs != windowEndNs)
+    {
+        qp->m_deadlineLastBlockedWindowEndNs = windowEndNs;
+        qp->m_deadlineBlockEventCount++;
+
+        const uint64_t cutoffNs =
+            reserveNs <= windowEndNs ? windowEndNs - reserveNs : 0;
+        const Time nextWindow =
+            LookupGate(qp, gate.currentWindowEnd).nextAllowedTime;
+        const int64_t nextWindowSignedNs = nextWindow.GetNanoSeconds();
+        const uint64_t nextWindowNs =
+            nextWindowSignedNs > 0
+                ? static_cast<uint64_t>(nextWindowSignedNs)
+                : 0;
+
+        std::cout
+            << "[RNIC DEADLINE BLOCK]"
+            << " t_ns=" << now.GetNanoSeconds()
+            << " node="
+            << (m_node != NULL ? static_cast<int64_t>(m_node->GetId()) : -1)
+            << " src=" << qp->m_src
+            << " dst=" << qp->m_dest
+            << " sport=" << qp->sport
+            << " plane="
+            << (qp->m_hasBoundRnicPort
+                    ? static_cast<int64_t>(qp->m_boundPlaneId)
+                    : -1)
+            << " rnic_port="
+            << (qp->m_hasBoundRnicPort
+                    ? static_cast<int64_t>(qp->m_boundRnicPort)
+                    : -1)
+            << " candidate_tx_ns=" << candidateNs
+            << " stable_end_ns=" << windowEndNs
+            << " cutoff_ns=" << cutoffNs
+            << " reserve_ns=" << reserveNs
+            << " next_window_start_ns=" << nextWindowNs
+            << " samples=" << qp->m_deadlineValidSamples
+            << " srtt_ns=" << qp->m_deadlineSrttNs
+            << " rttvar_ns=" << qp->m_deadlineRttVarNs
+            << " block_events=" << qp->m_deadlineBlockEventCount
+            << std::endl;
+    }
+
+    return false;
 }
 
 Time
@@ -531,7 +639,34 @@ RdmaTransport::GetNextRnicGateTime(Ptr<RdmaQueuePair> qp) const
     {
         return Simulator::Now();
     }
-    return GetNextAllowedTime(qp, Simulator::Now());
+
+    const Time now = Simulator::Now();
+    const GateLookupResult gate = LookupGate(qp, now);
+    if (gate.bypass || !gate.allowed)
+    {
+        return gate.nextAllowedTime;
+    }
+    if (m_rdma == NULL || !m_rdma->IsRnicDeadlineEnabled())
+    {
+        return now;
+    }
+
+    const Time candidateTx = std::max(now, qp->m_nextAvail);
+    const uint64_t reserveNs = m_rdma->GetRnicDeadlineReserveNs(qp);
+    const uint64_t candidateNs =
+        static_cast<uint64_t>(candidateTx.GetNanoSeconds());
+    const uint64_t windowEndNs =
+        static_cast<uint64_t>(gate.currentWindowEnd.GetNanoSeconds());
+
+    if (candidateNs <= windowEndNs &&
+        reserveNs <= windowEndNs - candidateNs)
+    {
+        return now;
+    }
+
+    // The physical circuit is still open, but its ACK-safe portion has ended.
+    // Wake at the next physical window for this destination, not immediately.
+    return LookupGate(qp, gate.currentWindowEnd).nextAllowedTime;
 }
 
 RdmaTransport::GateLookupResult
@@ -619,34 +754,306 @@ RdmaTransport::GetNextAllowedTime(
 }
 
 uint64_t
+RdmaTransport::GetPortBottleneckRateBps(
+    Ptr<RdmaQueuePair> qp) const
+{
+    uint64_t portRateBps = 0;
+    if (m_node != NULL &&
+        qp != NULL &&
+        qp->m_hasBoundRnicPort &&
+        qp->m_boundNicIdx < m_node->GetNDevices())
+    {
+        Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(
+            m_node->GetDevice(qp->m_boundNicIdx));
+        if (dev != NULL)
+        {
+            portRateBps = dev->GetDataRate().GetBitRate();
+        }
+    }
+
+    uint64_t configuredRateBps = m_bottleneckRateBps;
+    if (configuredRateBps == 0)
+    {
+        configuredRateBps = GetLocalBottleneckRateBps();
+    }
+    if (portRateBps == 0)
+    {
+        return configuredRateBps;
+    }
+    if (configuredRateBps == 0)
+    {
+        return portRateBps;
+    }
+    return std::min(portRateBps, configuredRateBps);
+}
+
+RdmaTransport::UserspacePortState&
+RdmaTransport::GetUserspacePortState(
+    Ptr<RdmaQueuePair> qp,
+    const char* reason)
+{
+    NS_ASSERT_MSG(qp != NULL, "Cannot resolve Mode-2 port state for a null QP");
+    NS_ASSERT_MSG(qp->m_hasBoundRnicPort,
+                  "Mode-2 OCS admission requires a QP bound by the plane scheduler");
+
+    const uint32_t rnicPort = qp->m_boundRnicPort;
+    std::map<uint32_t, UserspacePortState>::iterator found =
+        m_userspacePortStates.find(rnicPort);
+    if (found != m_userspacePortStates.end())
+    {
+        return found->second;
+    }
+
+    UserspacePortState state;
+    state.rnicPort = rnicPort;
+    state.planeId = qp->m_boundPlaneId;
+    state.ifIndex = qp->m_boundNicIdx;
+    state.bottleneckRateBps = GetPortBottleneckRateBps(qp);
+    if (state.bottleneckRateBps == 0)
+    {
+        state.bottleneckRateBps = std::max<uint64_t>(
+            m_bottleneckRateBps,
+            1000000000ULL);
+    }
+
+    const uint32_t activeQps = std::max<uint32_t>(1, m_activeQpHint);
+    const uint64_t safeFactorPermille =
+        m_realDeploymentMode ? 800ULL : 900ULL;
+    const uint64_t minFactorPermille =
+        m_realDeploymentMode ? 400ULL : 500ULL;
+    const uint64_t maxFactorPermille = 950ULL;
+    const long double rateBase =
+        static_cast<long double>(state.bottleneckRateBps) /
+        static_cast<long double>(activeQps);
+
+    state.minSafeRateBps = std::max<uint64_t>(
+        static_cast<uint64_t>(
+            rateBase * static_cast<long double>(minFactorPermille) / 1000.0L),
+        1000000000ULL);
+    state.maxSafeRateBps = std::max<uint64_t>(
+        static_cast<uint64_t>(
+            rateBase * static_cast<long double>(maxFactorPermille) / 1000.0L),
+        state.minSafeRateBps);
+    state.safeRateBps = ClampValue(
+        static_cast<uint64_t>(
+            rateBase * static_cast<long double>(safeFactorPermille) / 1000.0L),
+        state.minSafeRateBps,
+        state.maxSafeRateBps);
+    state.lastAdaptNs =
+        static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
+
+    std::pair<std::map<uint32_t, UserspacePortState>::iterator, bool> inserted =
+        m_userspacePortStates.insert(std::make_pair(rnicPort, state));
+    UserspacePortState& portState = inserted.first->second;
+
+    std::cout
+        << "[USERSPACE PORT INIT]"
+        << " reason=" << (reason != NULL ? reason : "unknown")
+        << " node="
+        << (m_node != NULL ? static_cast<int64_t>(m_node->GetId()) : -1)
+        << " rnic_port=" << portState.rnicPort
+        << " plane=" << portState.planeId
+        << " ifindex=" << portState.ifIndex
+        << " bottleneckRateBps=" << portState.bottleneckRateBps
+        << " configuredActiveQpHint=" << activeQps
+        << " safeFactorPermille=" << safeFactorPermille
+        << " minSafeRateBps=" << portState.minSafeRateBps
+        << " safeRateBps=" << portState.safeRateBps
+        << " maxSafeRateBps=" << portState.maxSafeRateBps
+        << " baseRttNs=" << qp->m_baseRtt
+        << " softwareGuardNs=" << m_userspaceSoftwareGuardNs
+        << " aggregateOutstandingBytes="
+        << portState.aggregateOutstandingBytes
+        << " stateScope=per_rnic_port"
+        << " switchingGuardAppliedNs=0"
+        << std::endl;
+
+    return portState;
+}
+
+const RdmaTransport::UserspacePortState*
+RdmaTransport::FindUserspacePortState(
+    Ptr<RdmaQueuePair> qp) const
+{
+    if (qp == NULL || !qp->m_hasBoundRnicPort)
+    {
+        return NULL;
+    }
+    std::map<uint32_t, UserspacePortState>::const_iterator found =
+        m_userspacePortStates.find(qp->m_boundRnicPort);
+    return found != m_userspacePortStates.end() ? &found->second : NULL;
+}
+
+void
+RdmaTransport::SchedulePortQpWakeups(
+    Ptr<RdmaQueuePair> triggerQp)
+{
+    if (triggerQp == NULL || !triggerQp->m_hasBoundRnicPort)
+    {
+        return;
+    }
+
+    const uint32_t rnicPort = triggerQp->m_boundRnicPort;
+    const Time wakeTime = Simulator::Now() + NanoSeconds(1);
+
+    for (std::map<uint64_t, Ptr<RdmaQueuePair> >::const_iterator it =
+             m_userspaceRegisteredQps.begin();
+         it != m_userspaceRegisteredQps.end();
+         ++it)
+    {
+        Ptr<RdmaQueuePair> candidate = it->second;
+        if (candidate == NULL ||
+            candidate->IsFinished() ||
+            candidate->GetUnpostedBytes() == 0 ||
+            !candidate->m_hasBoundRnicPort ||
+            candidate->m_boundRnicPort != rnicPort)
+        {
+            continue;
+        }
+
+        ScheduleNextWake(candidate, wakeTime);
+    }
+}
+
+uint64_t
+RdmaTransport::GetUserspaceTailGuardNs(
+    Ptr<RdmaQueuePair> qp,
+    const UserspacePortState& portState) const
+{
+    const uint64_t baseRttNs =
+        qp != NULL && qp->m_baseRtt > 0
+            ? qp->m_baseRtt
+            : std::max<uint64_t>(m_maxObservedRttNs, 10000ULL);
+    const uint64_t variationGuardNs =
+        portState.cqeLatencyRttvarNs >
+                std::numeric_limits<uint64_t>::max() / 4
+            ? std::numeric_limits<uint64_t>::max()
+            : 4 * portState.cqeLatencyRttvarNs;
+
+    uint64_t guardNs = baseRttNs;
+    if (guardNs <= std::numeric_limits<uint64_t>::max() - variationGuardNs)
+    {
+        guardNs += variationGuardNs;
+    }
+    else
+    {
+        guardNs = std::numeric_limits<uint64_t>::max();
+    }
+    if (guardNs <=
+        std::numeric_limits<uint64_t>::max() - m_userspaceSoftwareGuardNs)
+    {
+        guardNs += m_userspaceSoftwareGuardNs;
+    }
+    else
+    {
+        guardNs = std::numeric_limits<uint64_t>::max();
+    }
+    return ClampValue(guardNs, m_minTailGuardNs, m_maxTailGuardNs);
+}
+
+uint64_t
 RdmaTransport::GetSafeBudgetBytes(
+    Ptr<RdmaQueuePair> qp,
     const GateLookupResult& gate,
-    Time now) const
+    Time now)
 {
     if (gate.bypass)
     {
         return m_maxOutstandingBytes;
     }
-
     if (!gate.allowed || gate.currentWindowEnd <= now)
     {
         return 0;
     }
 
-    const uint64_t nowNs =
-        static_cast<uint64_t>(now.GetNanoSeconds());
+    UserspacePortState& portState =
+        GetUserspacePortState(qp, "safe_budget");
+    const uint64_t tailGuardNs =
+        GetUserspaceTailGuardNs(qp, portState);
+    const uint64_t nowNs = static_cast<uint64_t>(now.GetNanoSeconds());
     const uint64_t endNs =
         static_cast<uint64_t>(gate.currentWindowEnd.GetNanoSeconds());
-
-    if (endNs <= nowNs + m_tailGuardNs)
+    if (endNs <= nowNs + tailGuardNs)
     {
         return 0;
     }
 
-    const uint64_t usableNs = endNs - nowNs - m_tailGuardNs;
+    const uint64_t usableNs = endNs - nowNs - tailGuardNs;
+    const long double budgetBytes =
+        static_cast<long double>(portState.safeRateBps) *
+        static_cast<long double>(usableNs) / 8000000000.0L;
+    if (budgetBytes >=
+        static_cast<long double>(std::numeric_limits<uint64_t>::max()))
+    {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return static_cast<uint64_t>(budgetBytes);
+}
 
-    // bytes = bps * ns / 8 / 1e9
-    return (m_safeRateBps * usableNs) / 8000000000ULL;
+void
+RdmaTransport::UpdateCqeTimingModel(
+    Ptr<RdmaQueuePair> qp,
+    uint64_t completionLatencyNs)
+{
+    if (qp == NULL || completionLatencyNs == 0)
+    {
+        return;
+    }
+
+    UserspacePortState& portState =
+        GetUserspacePortState(qp, "cqe");
+    const uint64_t oldTailGuardNs =
+        GetUserspaceTailGuardNs(qp, portState);
+
+    if (portState.cqeTimingSamples == 0)
+    {
+        portState.cqeLatencySrttNs = completionLatencyNs;
+        portState.cqeLatencyRttvarNs = 0;
+    }
+    else
+    {
+        const uint64_t deltaNs =
+            completionLatencyNs >= portState.cqeLatencySrttNs
+                ? completionLatencyNs - portState.cqeLatencySrttNs
+                : portState.cqeLatencySrttNs - completionLatencyNs;
+        portState.cqeLatencyRttvarNs =
+            (3 * portState.cqeLatencyRttvarNs + deltaNs) / 4;
+        portState.cqeLatencySrttNs =
+            (7 * portState.cqeLatencySrttNs + completionLatencyNs) / 8;
+    }
+
+    ++portState.cqeTimingSamples;
+    const uint64_t newTailGuardNs =
+        GetUserspaceTailGuardNs(qp, portState);
+    const bool powerOfTwoSample =
+        (portState.cqeTimingSamples & (portState.cqeTimingSamples - 1)) == 0;
+
+    if (m_enabled &&
+        (portState.cqeTimingSamples <= 4 ||
+         (powerOfTwoSample && oldTailGuardNs != newTailGuardNs)))
+    {
+        std::cout
+            << "[USERSPACE CQE GUARD]"
+            << " t_ns=" << Simulator::Now().GetNanoSeconds()
+            << " node="
+            << (m_node != NULL ? static_cast<int64_t>(m_node->GetId()) : -1)
+            << " rnic_port=" << portState.rnicPort
+            << " plane=" << portState.planeId
+            << " ifindex=" << portState.ifIndex
+            << " dst=" << qp->GetDest()
+            << " sport=" << qp->sport
+            << " samples=" << portState.cqeTimingSamples
+            << " sampleLatencyNs=" << completionLatencyNs
+            << " cqeSrttNs=" << portState.cqeLatencySrttNs
+            << " cqeRttvarNs=" << portState.cqeLatencyRttvarNs
+            << " baseRttNs=" << qp->m_baseRtt
+            << " softwareGuardNs=" << m_userspaceSoftwareGuardNs
+            << " oldTailGuardNs=" << oldTailGuardNs
+            << " newTailGuardNs=" << newTailGuardNs
+            << " stateScope=per_rnic_port"
+            << " switchingGuardAppliedNs=0"
+            << std::endl;
+    }
 }
 
 uint64_t
@@ -660,150 +1067,100 @@ RdmaTransport::GetAdaptivePeriodNs() const
 void
 RdmaTransport::MaybeAdapt(Ptr<RdmaQueuePair> qp)
 {
-    if (!m_enabled)
+    if (!m_enabled ||
+        m_userspaceAdmissionMode != USERSPACE_OCS_WINDOWED ||
+        qp == NULL)
     {
         return;
     }
 
-    uint64_t nowNs =
-        static_cast<uint64_t>(
-            Simulator::Now().GetNanoSeconds());
+    UserspacePortState& portState =
+        GetUserspacePortState(qp, "adapt");
+    const uint64_t nowNs =
+        static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
+    const uint64_t periodNs = GetAdaptivePeriodNs();
+    const bool urgent = portState.recoverySinceLastAdapt;
 
-    uint64_t periodNs = GetAdaptivePeriodNs();
-
-    bool urgent = m_recoverySinceLastAdapt;
-
-    // Recovery is a safety signal and should react quickly.  Loss-free
-    // increase is evaluated only once per OCS period to avoid oscillation.
     if (!urgent &&
-        m_lastAdaptNs > 0 &&
-        nowNs < m_lastAdaptNs + periodNs)
+        portState.lastAdaptNs > 0 &&
+        nowNs < portState.lastAdaptNs + periodNs)
     {
         return;
     }
-
-    // Avoid repeated multiplicative decrease for a burst of NACKs that belong
-    // to the same loss episode.
     if (urgent &&
-        m_lastAdaptNs > 0 &&
-        nowNs < m_lastAdaptNs + 1000000ULL)
+        portState.lastAdaptNs > 0 &&
+        nowNs < portState.lastAdaptNs + 1000000ULL)
     {
         return;
     }
 
-    uint64_t oldSafeRateBps = m_safeRateBps;
-    uint64_t oldTailGuardNs = m_tailGuardNs;
-    uint64_t oldMaxOutstandingBytes = m_maxOutstandingBytes;
-
+    const uint64_t oldSafeRateBps = portState.safeRateBps;
+    const uint64_t oldTailGuardNs =
+        GetUserspaceTailGuardNs(qp, portState);
     const char* action = "hold";
 
-    if (m_recoverySinceLastAdapt)
+    if (portState.recoverySinceLastAdapt)
     {
-        // Multiplicative decrease on recovery/retransmission signal.
-        m_safeRateBps = std::max<uint64_t>(
-            m_minSafeRateBps,
-            (m_safeRateBps * 8) / 10);
-
-        m_tailGuardNs = std::min<uint64_t>(
-            m_maxTailGuardNs,
-            m_tailGuardNs + 25000ULL);
-
-        m_maxOutstandingBytes = std::max<uint64_t>(
-            m_minOutstandingBytes,
-            (m_maxOutstandingBytes * 8) / 10);
-
-        if (m_maxOutstandingBytes < m_wrChunkBytes)
-        {
-            m_maxOutstandingBytes = m_wrChunkBytes;
-        }
-
-        m_stableAdaptPeriods = 0;
+        portState.safeRateBps = std::max<uint64_t>(
+            portState.minSafeRateBps,
+            (portState.safeRateBps * 8) / 10);
+        portState.cqeLatencyRttvarNs = std::min<uint64_t>(
+            m_maxTailGuardNs / 4,
+            portState.cqeLatencyRttvarNs + 6250ULL);
+        portState.stableAdaptPeriods = 0;
         action = "decrease";
     }
     else if (false &&
-             m_backlogSinceLastAdapt &&
-             m_ackProgressSinceLastAdapt)
+             portState.backlogSinceLastAdapt &&
+             portState.wrCompletionSinceLastAdapt)
     {
-        // Additive/slow increase when the flow is backlogged and the previous
-        // period had no recovery.  This improves utilization without relying on
-        // AI/RL.
-        m_stableAdaptPeriods++;
-
-        if (m_stableAdaptPeriods >= 2)
+        ++portState.stableAdaptPeriods;
+        if (portState.stableAdaptPeriods >= 2)
         {
-            m_safeRateBps = std::min<uint64_t>(
-                m_maxSafeRateBps,
-                (m_safeRateBps * 105) / 100);
-
-            if (m_tailGuardNs > m_minTailGuardNs)
-            {
-                uint64_t dec = 5000ULL;
-                m_tailGuardNs =
-                    m_tailGuardNs > m_minTailGuardNs + dec
-                        ? m_tailGuardNs - dec
-                        : m_minTailGuardNs;
-            }
-
-            if ((m_stableAdaptPeriods % 3) == 0)
-            {
-                m_maxOutstandingBytes = std::min<uint64_t>(
-                    m_maxOutstandingCeilingBytes,
-                    m_maxOutstandingBytes + 8 * 1024);
-            }
-
+            portState.safeRateBps = std::min<uint64_t>(
+                portState.maxSafeRateBps,
+                (portState.safeRateBps * 105) / 100);
             action = "increase";
         }
     }
     else
     {
-        m_stableAdaptPeriods = 0;
+        portState.stableAdaptPeriods = 0;
     }
 
-    if (oldSafeRateBps != m_safeRateBps ||
-        oldTailGuardNs != m_tailGuardNs ||
-        oldMaxOutstandingBytes != m_maxOutstandingBytes)
+    const uint64_t newTailGuardNs =
+        GetUserspaceTailGuardNs(qp, portState);
+    if (oldSafeRateBps != portState.safeRateBps ||
+        oldTailGuardNs != newTailGuardNs)
     {
-        uint32_t srcNodeId =
-            m_node != NULL
-                ? m_node->GetId()
-                : 0;
-
-        uint32_t dstNodeId = 0;
-        uint64_t unposted = 0;
-        uint64_t outstanding = 0;
-
-        if (qp != NULL)
-        {
-            dstNodeId = qp->GetDest();
-            unposted = qp->GetUnpostedBytes();
-            outstanding = qp->GetPostedOutstandingBytes();
-        }
-
         std::cout
             << "[USERSPACE ADAPT]"
             << " t=" << nowNs
-            << " rnic=" << srcNodeId
+            << " node="
+            << (m_node != NULL ? static_cast<int64_t>(m_node->GetId()) : -1)
+            << " rnic_port=" << portState.rnicPort
+            << " plane=" << portState.planeId
+            << " ifindex=" << portState.ifIndex
             << " action=" << action
-            << " dst=" << dstNodeId
+            << " dst=" << qp->GetDest()
             << " oldSafeRateBps=" << oldSafeRateBps
-            << " newSafeRateBps=" << m_safeRateBps
+            << " newSafeRateBps=" << portState.safeRateBps
             << " oldTailGuardNs=" << oldTailGuardNs
-            << " newTailGuardNs=" << m_tailGuardNs
-            << " oldMaxOutstandingBytes=" << oldMaxOutstandingBytes
-            << " newMaxOutstandingBytes=" << m_maxOutstandingBytes
-            << " recovery=" << (m_recoverySinceLastAdapt ? 1 : 0)
-            << " ackProgress=" << (m_ackProgressSinceLastAdapt ? 1 : 0)
-            << " backlog=" << (m_backlogSinceLastAdapt ? 1 : 0)
-            << " stablePeriods=" << m_stableAdaptPeriods
-            << " unposted=" << unposted
-            << " outstanding=" << outstanding
+            << " newTailGuardNs=" << newTailGuardNs
+            << " recovery=" << (portState.recoverySinceLastAdapt ? 1 : 0)
+            << " wrCompletion=" << (portState.wrCompletionSinceLastAdapt ? 1 : 0)
+            << " backlog=" << (portState.backlogSinceLastAdapt ? 1 : 0)
+            << " stablePeriods=" << portState.stableAdaptPeriods
+            << " unposted=" << qp->GetUnpostedBytes()
+            << " outstanding=" << GetUserspaceOutstandingBytes(qp)
+            << " stateScope=per_rnic_port"
             << std::endl;
     }
 
-    m_lastAdaptNs = nowNs;
-    m_recoverySinceLastAdapt = false;
-    m_ackProgressSinceLastAdapt = false;
-    m_backlogSinceLastAdapt = false;
+    portState.lastAdaptNs = nowNs;
+    portState.recoverySinceLastAdapt = false;
+    portState.wrCompletionSinceLastAdapt = false;
+    portState.backlogSinceLastAdapt = false;
 }
 
 void
@@ -860,11 +1217,37 @@ RdmaTransport::GetPostStatsKey(
         qp->m_pg);
 }
 
+
+RdmaTransport::UserspaceQpState&
+RdmaTransport::GetUserspaceQpState(Ptr<RdmaQueuePair> qp)
+{
+    NS_ASSERT(qp != NULL);
+    return m_userspaceQpStates[GetPostStatsKey(qp)];
+}
+
+uint64_t
+RdmaTransport::GetUserspaceOutstandingBytes(Ptr<RdmaQueuePair> qp) const
+{
+    if (qp == NULL)
+    {
+        return 0;
+    }
+
+    const uint64_t key =
+        RdmaHw::GetQpKey(qp->dip.Get(), qp->sport, qp->m_pg);
+    std::map<uint64_t, UserspaceQpState>::const_iterator it =
+        m_userspaceQpStates.find(key);
+    return it != m_userspaceQpStates.end()
+        ? it->second.outstandingBytes
+        : 0;
+}
+
 void
 RdmaTransport::RecordPost(
     Ptr<RdmaQueuePair> qp,
     uint64_t bytes,
-    uint64_t safeBudget,
+    uint64_t windowBudget,
+    uint64_t admissionBudget,
     Time windowEnd)
 {
     if (qp == NULL)
@@ -895,7 +1278,7 @@ RdmaTransport::RecordPost(
     st.totalBytes += bytes;
     st.lastPostTimeNs = nowNs;
 
-    if (safeBudget > 0 && bytes >= safeBudget)
+    if (admissionBudget > 0 && bytes >= admissionBudget)
     {
         st.safeBudgetLimitedCount++;
     }
@@ -920,8 +1303,17 @@ RdmaTransport::RecordPost(
             << " pg=" << qp->m_pg
             << " bytes=" << bytes
             << " postedLimit=" << qp->GetPostedLimit()
-            << " outstanding=" << qp->GetPostedOutstandingBytes()
-            << " safeBudget=" << safeBudget
+            << " qp_outstanding_bytes="
+            << GetUserspaceOutstandingBytes(qp);
+
+        const UserspacePortState* portState = FindUserspacePortState(qp);
+        std::cout
+            << " port_outstanding_bytes="
+            << (portState != NULL
+                    ? portState->aggregateOutstandingBytes
+                    : GetUserspaceOutstandingBytes(qp))
+            << " window_budget_bytes=" << windowBudget
+            << " admission_budget_bytes=" << admissionBudget
             << " windowEnd=" << windowEnd.GetNanoSeconds()
             << " sample=" << (st.sampleCount + 1)
             << " sample_limit=" << m_postLogSampleLimit
@@ -940,38 +1332,24 @@ RdmaTransport::FlushPostSummary(
         return;
     }
 
-    uint64_t key = GetPostStatsKey(qp);
-
-    std::map<uint64_t, PostStats>::iterator it =
-        m_postStats.find(key);
-
-    if (it == m_postStats.end() ||
-        it->second.postCount == 0)
+    const uint64_t key = GetPostStatsKey(qp);
+    std::map<uint64_t, PostStats>::iterator it = m_postStats.find(key);
+    if (it == m_postStats.end() || it->second.postCount == 0)
     {
         return;
     }
 
-    PostStats st = it->second;
+    const PostStats st = it->second;
     m_postStats.erase(it);
-
-    uint32_t srcNodeId =
-        m_node != NULL
-            ? m_node->GetId()
-            : 0;
-
-    uint32_t dstNodeId =
-        qp->GetDest();
-
-    uint64_t avgBytes =
-        st.postCount > 0
-            ? st.totalBytes / st.postCount
-            : 0;
+    const uint32_t srcNodeId = m_node != NULL ? m_node->GetId() : 0;
+    const uint64_t avgBytes =
+        st.postCount > 0 ? st.totalBytes / st.postCount : 0;
 
     std::cout
         << "[USERSPACE WR SUMMARY]"
         << " t=" << Simulator::Now().GetNanoSeconds()
         << " src=" << srcNodeId
-        << " dst=" << dstNodeId
+        << " dst=" << qp->GetDest()
         << " sport=" << qp->sport
         << " dport=" << qp->dport
         << " pg=" << qp->m_pg
@@ -983,12 +1361,77 @@ RdmaTransport::FlushPostSummary(
         << " first_post=" << st.firstPostTimeNs
         << " last_post=" << st.lastPostTimeNs
         << " safe_budget_limited=" << st.safeBudgetLimitedCount
+        << " cqe_count=" << st.completionCount
+        << " completed_bytes=" << st.completedBytes
+        << " avg_completion_latency_ns="
+        << (st.completionCount > 0
+                ? st.totalCompletionLatencyNs / st.completionCount
+                : 0)
+        << " min_completion_latency_ns=" << st.minCompletionLatencyNs
+        << " max_completion_latency_ns=" << st.maxCompletionLatencyNs
+        << " last_completed_wr_id=" << st.lastCompletedWrId
+        << " userspace_outstanding_bytes="
+        << GetUserspaceOutstandingBytes(qp);
+
+    const UserspacePortState* portState = FindUserspacePortState(qp);
+    if (portState != NULL)
+    {
+        std::cout
+            << " rnic_port=" << portState->rnicPort
+            << " plane=" << portState->planeId
+            << " ifindex=" << portState->ifIndex
+            << " safe_rate_bps=" << portState->safeRateBps
+            << " tail_guard_ns=" << GetUserspaceTailGuardNs(qp, *portState)
+            << " cqe_timing_samples=" << portState->cqeTimingSamples
+            << " cqe_srtt_ns=" << portState->cqeLatencySrttNs
+            << " cqe_rttvar_ns=" << portState->cqeLatencyRttvarNs
+            << " port_outstanding_bytes="
+            << portState->aggregateOutstandingBytes
+            << " registered_qp_count=" << portState->registeredQpCount
+            << " aggregate_admission_block_events="
+            << portState->aggregateAdmissionBlockEvents
+            << " state_scope=per_rnic_port";
+    }
+    else
+    {
+        std::cout
+            << " rnic_port=-1"
+            << " plane=-1"
+            << " ifindex=-1"
+            << " safe_rate_bps=" << m_safeRateBps
+            << " tail_guard_ns=" << m_tailGuardNs
+            << " cqe_timing_samples=0"
+            << " cqe_srtt_ns=0"
+            << " cqe_rttvar_ns=0"
+            << " state_scope=transport_template";
+    }
+
+    std::cout
+        << " switching_guard_applied_ns=0"
+        << " guard_model=qp_rtt_plus_4xport_cqe_var_plus_software"
+        << " completion_semantic=signaled_wr_busy_poll"
         << " sample_limit=" << m_postLogSampleLimit
         << std::endl;
+
+    m_userspaceQpStates.erase(key);
 }
+
 
 void
 RdmaTransport::TrySubmit(
+    Ptr<RdmaQueuePair> qp)
+{
+    if (m_userspaceAdmissionMode == USERSPACE_DEFAULT_PIPELINE)
+    {
+        TrySubmitDefaultPipeline(qp);
+        return;
+    }
+
+    TrySubmitOcsWindowed(qp);
+}
+
+void
+RdmaTransport::TrySubmitDefaultPipeline(
     Ptr<RdmaQueuePair> qp)
 {
     if (!m_enabled ||
@@ -1000,12 +1443,67 @@ RdmaTransport::TrySubmit(
         return;
     }
 
-    if (qp->GetUnpostedBytes() > 0)
+    UserspaceQpState& state = GetUserspaceQpState(qp);
+
+    while (qp->GetUnpostedBytes() > 0)
     {
-        m_backlogSinceLastAdapt = true;
+        const uint64_t outstandingHeadroom =
+            m_maxOutstandingBytes > state.outstandingBytes
+                ? m_maxOutstandingBytes - state.outstandingBytes
+                : 0;
+
+        if (outstandingHeadroom == 0)
+        {
+            break;
+        }
+
+        const uint64_t unpostedBytes = qp->GetUnpostedBytes();
+        uint64_t nextWrBytes = std::min(m_wrChunkBytes, unpostedBytes);
+        nextWrBytes = std::min(nextWrBytes, outstandingHeadroom);
+
+        if (nextWrBytes == 0)
+        {
+            break;
+        }
+
+        // One Mode-2 chunk equals one signaled WR.  Unlike OCS-windowed
+        // admission, the continuously reachable baseline may keep several WRs
+        // outstanding and relies only on CQE credit recovery.
+        m_rdma->PostWork(qp, nextWrBytes);
+        state.postedBytes += nextWrBytes;
+        state.outstandingBytes += nextWrBytes;
+
+        RecordPost(
+            qp,
+            nextWrBytes,
+            0,
+            0,
+            Simulator::GetMaximumSimulationTime());
+    }
+}
+
+void
+RdmaTransport::TrySubmitOcsWindowed(
+    Ptr<RdmaQueuePair> qp)
+{
+    if (!m_enabled ||
+        qp == NULL ||
+        m_rdma == NULL ||
+        qp->IsFinished() ||
+        qp->GetUnpostedBytes() == 0)
+    {
+        return;
     }
 
-    uint64_t outstanding = qp->GetPostedOutstandingBytes();
+    UserspacePortState& portState =
+        GetUserspacePortState(qp, "submit");
+    if (qp->GetUnpostedBytes() > 0)
+    {
+        portState.backlogSinceLastAdapt = true;
+    }
+
+    UserspaceQpState& state = GetUserspaceQpState(qp);
+    uint64_t outstanding = state.outstandingBytes;
 
     while (qp->GetUnpostedBytes() > 0)
     {
@@ -1018,12 +1516,11 @@ RdmaTransport::TrySubmit(
             break;
         }
 
-        const uint64_t safeBudget = GetSafeBudgetBytes(gate, loopNow);
-
+        const uint64_t safeBudget =
+            GetSafeBudgetBytes(qp, gate, loopNow);
         if (safeBudget < m_minPostBytes)
         {
-            m_backlogSinceLastAdapt = true;
-
+            portState.backlogSinceLastAdapt = true;
             if (gate.currentWindowEnd > loopNow &&
                 gate.currentWindowEnd != Simulator::GetMaximumSimulationTime())
             {
@@ -1031,7 +1528,47 @@ RdmaTransport::TrySubmit(
                     LookupGate(qp, gate.currentWindowEnd + NanoSeconds(1));
                 ScheduleNextWake(qp, nextGate.nextAllowedTime);
             }
+            break;
+        }
 
+        const uint64_t portOutstanding =
+            portState.aggregateOutstandingBytes;
+        const uint64_t admissionBudget =
+            safeBudget > portOutstanding
+                ? safeBudget - portOutstanding
+                : 0;
+        if (admissionBudget < m_minPostBytes)
+        {
+            portState.backlogSinceLastAdapt = true;
+
+            const uint64_t windowEndNs = static_cast<uint64_t>(
+                gate.currentWindowEnd.GetNanoSeconds());
+            if (state.lastAggregateBlockWindowEndNs != windowEndNs)
+            {
+                state.lastAggregateBlockWindowEndNs = windowEndNs;
+                portState.aggregateAdmissionBlockEvents++;
+
+                std::cout
+                    << "[USERSPACE PORT ADMISSION BLOCK]"
+                    << " t_ns=" << loopNow.GetNanoSeconds()
+                    << " node="
+                    << (m_node != NULL
+                            ? static_cast<int64_t>(m_node->GetId())
+                            : -1)
+                    << " dst=" << qp->GetDest()
+                    << " sport=" << qp->sport
+                    << " pg=" << qp->m_pg
+                    << " rnic_port=" << portState.rnicPort
+                    << " plane=" << portState.planeId
+                    << " ifindex=" << portState.ifIndex
+                    << " qp_outstanding_bytes=" << outstanding
+                    << " port_outstanding_bytes=" << portOutstanding
+                    << " window_budget_bytes=" << safeBudget
+                    << " admission_budget_bytes=" << admissionBudget
+                    << " window_end_ns=" << windowEndNs
+                    << " stateScope=per_rnic_port"
+                    << std::endl;
+            }
             break;
         }
 
@@ -1039,110 +1576,240 @@ RdmaTransport::TrySubmit(
             m_maxOutstandingBytes > outstanding
                 ? m_maxOutstandingBytes - outstanding
                 : 0;
-
         if (outstandingHeadroom < m_minPostBytes)
         {
-            m_backlogSinceLastAdapt = true;
+            portState.backlogSinceLastAdapt = true;
             break;
         }
 
         const uint64_t unpostedBytes = qp->GetUnpostedBytes();
-
         uint64_t nextWrBytes = std::min(m_wrChunkBytes, unpostedBytes);
         nextWrBytes = std::min(nextWrBytes, outstandingHeadroom);
-        nextWrBytes = std::min(nextWrBytes, safeBudget);
-
+        nextWrBytes = std::min(nextWrBytes, admissionBudget);
         const bool isFinalTail = nextWrBytes == unpostedBytes;
-
         if (nextWrBytes < m_minPostBytes && !isFinalTail)
         {
             break;
         }
 
-        m_rdma->PostWork(qp, nextWrBytes);
-        outstanding += nextWrBytes;
+        NS_ASSERT_MSG(
+            portState.aggregateOutstandingBytes <=
+                std::numeric_limits<uint64_t>::max() - nextWrBytes,
+            "Mode-2 per-port outstanding ledger overflow");
 
-        // Simulator time does not advance inside PostWork(), so the lookup
-        // result obtained for this admission decision remains valid.
+        m_rdma->PostWork(qp, nextWrBytes);
+        state.postedBytes += nextWrBytes;
+        state.outstandingBytes += nextWrBytes;
+        portState.aggregateOutstandingBytes += nextWrBytes;
+        outstanding = state.outstandingBytes;
         RecordPost(
             qp,
             nextWrBytes,
             safeBudget,
+            admissionBudget,
             gate.currentWindowEnd);
     }
 
     MaybeAdapt(qp);
 }
 
+
 void
 RdmaTransport::RegisterQp(
     Ptr<RdmaQueuePair> qp)
 {
     NS_ASSERT(qp != NULL);
+    GetUserspaceQpState(qp);
 
-    if (qp->m_baseRtt > m_maxObservedRttNs)
+    const uint64_t key = GetPostStatsKey(qp);
+    const bool newlyRegistered =
+        m_userspaceRegisteredQps.insert(std::make_pair(key, qp)).second;
+
+    if (m_userspaceAdmissionMode == USERSPACE_OCS_WINDOWED)
     {
-        m_maxObservedRttNs = qp->m_baseRtt;
-        ApplyBandwidthNormalizedConfig("qp_base_rtt");
-    }
-
-    TrySubmit(qp);
-}
-
-void
-RdmaTransport::NotifyAckProgress(
-    Ptr<RdmaQueuePair> qp)
-{
-    if (!m_enabled)
-    {
-        return;
-    }
-
-    if (qp != NULL)
-    {
-        m_ackProgressSinceLastAdapt = true;
-
-        if (qp->GetUnpostedBytes() > 0)
+        UserspacePortState& portState =
+            GetUserspacePortState(qp, "register_qp");
+        if (newlyRegistered)
         {
-            m_backlogSinceLastAdapt = true;
+            portState.registeredQpCount++;
+
+            std::cout
+                << "[USERSPACE PORT QP REGISTERED]"
+                << " t_ns=" << Simulator::Now().GetNanoSeconds()
+                << " node="
+                << (m_node != NULL
+                        ? static_cast<int64_t>(m_node->GetId())
+                        : -1)
+                << " rnic_port=" << portState.rnicPort
+                << " plane=" << portState.planeId
+                << " ifindex=" << portState.ifIndex
+                << " configuredActiveQpHint="
+                << std::max<uint32_t>(1, m_activeQpHint)
+                << " registeredQpCount="
+                << portState.registeredQpCount
+                << " aggregateOutstandingBytes="
+                << portState.aggregateOutstandingBytes
+                << " stateScope=per_rnic_port"
+                << std::endl;
         }
     }
 
-    MaybeAdapt(qp);
+    TrySubmit(qp);
+}
 
-    if (qp != NULL && qp->IsFinished())
+
+void
+RdmaTransport::NotifyWrCompletion(
+    Ptr<RdmaQueuePair> qp,
+    uint64_t wrId,
+    uint64_t bytes,
+    uint64_t postTimeNs,
+    uint64_t completionTimeNs)
+{
+    if (!m_enabled || qp == NULL)
     {
-        FlushPostSummary(qp);
         return;
     }
 
-    TrySubmit(qp);
+    const uint64_t key = GetPostStatsKey(qp);
+    UserspaceQpState& state = m_userspaceQpStates[key];
+    NS_ASSERT_MSG(
+        state.outstandingBytes >= bytes,
+        "CQE completed more bytes than the userspace QP ledger has outstanding");
 
-    if (qp != NULL && qp->IsFinished())
+    UserspacePortState* portState = NULL;
+    if (m_userspaceAdmissionMode == USERSPACE_OCS_WINDOWED)
     {
-        FlushPostSummary(qp);
+        portState = &GetUserspacePortState(qp, "completion");
+        NS_ASSERT_MSG(
+            portState->aggregateOutstandingBytes >= bytes,
+            "CQE completed more bytes than the userspace port ledger has outstanding");
+    }
+
+    state.outstandingBytes -= bytes;
+    state.completedBytes += bytes;
+    if (portState != NULL)
+    {
+        portState->aggregateOutstandingBytes -= bytes;
+    }
+
+    PostStats& stats = m_postStats[key];
+    const uint64_t latencyNs = completionTimeNs >= postTimeNs
+        ? completionTimeNs - postTimeNs
+        : 0;
+
+    if (m_userspaceAdmissionMode == USERSPACE_OCS_WINDOWED)
+    {
+        UpdateCqeTimingModel(qp, latencyNs);
+    }
+
+    stats.completionCount++;
+    stats.completedBytes += bytes;
+    stats.totalCompletionLatencyNs += latencyNs;
+    stats.lastCompletedWrId = wrId;
+
+    if (stats.completionCount == 1)
+    {
+        stats.minCompletionLatencyNs = latencyNs;
+        stats.maxCompletionLatencyNs = latencyNs;
+        std::cout
+            << "[USERSPACE CQE]"
+            << " t_ns=" << completionTimeNs
+            << " src="
+            << (m_node != NULL ? static_cast<int64_t>(m_node->GetId()) : -1)
+            << " dst=" << qp->GetDest()
+            << " sport=" << qp->sport
+            << " dport=" << qp->dport
+            << " pg=" << qp->m_pg
+            << " wr_id=" << wrId
+            << " bytes=" << bytes
+            << " post_time_ns=" << postTimeNs
+            << " completion_latency_ns=" << latencyNs
+            << " qp_outstanding_bytes=" << state.outstandingBytes
+            << " port_outstanding_bytes="
+            << (portState != NULL
+                    ? portState->aggregateOutstandingBytes
+                    : state.outstandingBytes)
+            << " semantic=signaled_wr_busy_poll"
+            << std::endl;
+    }
+    else
+    {
+        stats.minCompletionLatencyNs =
+            std::min(stats.minCompletionLatencyNs, latencyNs);
+        stats.maxCompletionLatencyNs =
+            std::max(stats.maxCompletionLatencyNs, latencyNs);
+    }
+
+    if (portState != NULL)
+    {
+        portState->wrCompletionSinceLastAdapt = true;
+        if (qp->GetUnpostedBytes() > 0)
+        {
+            portState->backlogSinceLastAdapt = true;
+        }
+
+        MaybeAdapt(qp);
+        SchedulePortQpWakeups(qp);
+    }
+
+    // Models immediate observation by a dedicated CQ busy-poll thread.
+    // Final summary/cleanup is deferred to NotifyQpComplete(), because one
+    // cumulative ACK may complete several signaled WRs at the same timestamp.
+    if (!qp->IsFinished() &&
+        m_userspaceAdmissionMode == USERSPACE_DEFAULT_PIPELINE)
+    {
+        TrySubmit(qp);
     }
 }
 
 void
-RdmaTransport::NotifyRecover(
-    Ptr<RdmaQueuePair> qp)
+RdmaTransport::NotifyQpComplete(Ptr<RdmaQueuePair> qp)
 {
-    if (!m_enabled)
+    if (!m_enabled || qp == NULL)
     {
         return;
     }
 
-    m_recoverySinceLastAdapt = true;
+    const uint64_t outstanding = GetUserspaceOutstandingBytes(qp);
+    NS_ASSERT_MSG(
+        outstanding == 0,
+        "QP completed before all signaled WR completions reached userspace");
 
-    if (qp != NULL &&
-        (qp->GetUnpostedBytes() > 0 ||
-         qp->GetPostedOutstandingBytes() > 0))
+    UserspacePortState* portState = NULL;
+    if (m_userspaceAdmissionMode == USERSPACE_OCS_WINDOWED &&
+        qp->m_hasBoundRnicPort)
     {
-        m_backlogSinceLastAdapt = true;
+        portState = &GetUserspacePortState(qp, "qp_complete");
     }
 
-    MaybeAdapt(qp);
+    FlushPostSummary(qp);
+
+    const uint64_t key = GetPostStatsKey(qp);
+    m_userspaceQpStates.erase(key);
+    if (m_userspaceRegisteredQps.erase(key) > 0 &&
+        portState != NULL &&
+        portState->registeredQpCount > 0)
+    {
+        portState->registeredQpCount--;
+
+        std::cout
+            << "[USERSPACE PORT QP UNREGISTERED]"
+            << " t_ns=" << Simulator::Now().GetNanoSeconds()
+            << " node="
+            << (m_node != NULL
+                    ? static_cast<int64_t>(m_node->GetId())
+                    : -1)
+            << " rnic_port=" << portState->rnicPort
+            << " plane=" << portState->planeId
+            << " ifindex=" << portState->ifIndex
+            << " registeredQpCount="
+            << portState->registeredQpCount
+            << " aggregateOutstandingBytes="
+            << portState->aggregateOutstandingBytes
+            << " stateScope=per_rnic_port"
+            << std::endl;
+    }
 }
 
 } // namespace ns3

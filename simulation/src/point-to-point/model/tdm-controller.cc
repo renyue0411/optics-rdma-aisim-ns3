@@ -48,25 +48,6 @@ LcmUint64 (uint64_t a, uint64_t b)
   return a / GcdUint64 (a, b) * b;
 }
 
-static uint64_t
-CeilDivUint64 (uint64_t a, uint64_t b)
-{
-  NS_ASSERT_MSG (b > 0, "division by zero");
-  return (a + b - 1) / b;
-}
-
-static uint64_t
-CalcSerializationNs (uint32_t packetBytes, uint64_t bandwidthBps)
-{
-  if (bandwidthBps == 0 || packetBytes == 0)
-    {
-      return 0;
-    }
-
-  return CeilDivUint64 (static_cast<uint64_t> (packetBytes) * 8ULL * 1000000000ULL,
-                        bandwidthBps);
-}
-
 static std::string
 FormatDestinationBitmap (const std::vector<uint64_t> &bitmapWords)
 {
@@ -142,10 +123,6 @@ TdmController::GetTypeId (void)
 }
 
 TdmController::TdmController ()
-  : m_rnicGatePacketBytes (1200),
-    m_rnicGateAckBytes (92),
-    m_rnicGateExtraMarginNs (200000),
-    m_rnicGateBurstBytes (65536)
 {
 }
 
@@ -157,30 +134,6 @@ void
 TdmController::SetNodeContainer (NodeContainer nodes)
 {
   m_nodes = nodes;
-}
-
-void
-TdmController::SetRnicGatePacketBytes (uint32_t packetBytes)
-{
-  m_rnicGatePacketBytes = packetBytes;
-}
-
-void
-TdmController::SetRnicGateAckBytes (uint32_t packetBytes)
-{
-  m_rnicGateAckBytes = packetBytes;
-}
-
-void
-TdmController::SetRnicGateExtraMarginNs (uint64_t marginNs)
-{
-  m_rnicGateExtraMarginNs = marginNs;
-}
-
-void
-TdmController::SetRnicGateBurstBytes (uint64_t burstBytes)
-{
-  m_rnicGateBurstBytes = burstBytes;
 }
 
 void
@@ -1041,81 +994,6 @@ TdmController::CompileRnicReachabilityWindows ()
    * when the RNIC gate is enabled.
    */
 
-  auto GetEndpointSourceOffsetNs =
-    [&] (const RnicGroup &group, uint32_t packetBytes) -> uint64_t
-    {
-      uint64_t maxOffsetNs = 0;
-
-      for (uint32_t r = 0; r < group.endpoints.size (); ++r)
-        {
-          const RnicEndpoint &endpoint = group.endpoints[r];
-          std::map<uint32_t, std::map<uint32_t, PortBinding> >::const_iterator nodeIt =
-            m_portBindings.find (endpoint.nodeId);
-
-          NS_ASSERT_MSG (nodeIt != m_portBindings.end (),
-                         "endpoint RNIC has no port binding");
-          std::map<uint32_t, PortBinding>::const_iterator portIt =
-            nodeIt->second.find (endpoint.rnicPortId);
-          NS_ASSERT_MSG (portIt != nodeIt->second.end (),
-                         "endpoint RNIC plane port has no binding");
-
-          const PortBinding &binding = portIt->second;
-          uint64_t serNs = CalcSerializationNs (packetBytes,
-                                                binding.linkBandwidthBps);
-          uint64_t offsetNs = binding.linkDelayNs + serNs;
-
-          if (offsetNs > maxOffsetNs)
-            {
-              maxOffsetNs = offsetNs;
-            }
-        }
-
-      return maxOffsetNs;
-    };
-
-  auto GetEndpointDataDeliveryExtraNs =
-    [&] (const RnicGroup &group) -> uint64_t
-    {
-      uint64_t maxExtraNs = 0;
-
-      for (uint32_t r = 0; r < group.endpoints.size (); ++r)
-        {
-          const RnicEndpoint &endpoint = group.endpoints[r];
-          std::map<uint32_t, std::map<uint32_t, PortBinding> >::const_iterator nodeIt =
-            m_portBindings.find (endpoint.nodeId);
-
-          NS_ASSERT_MSG (nodeIt != m_portBindings.end (),
-                         "destination RNIC has no port binding");
-          std::map<uint32_t, PortBinding>::const_iterator portIt =
-            nodeIt->second.find (endpoint.rnicPortId);
-          NS_ASSERT_MSG (portIt != nodeIt->second.end (),
-                         "destination RNIC plane port has no binding");
-
-          const PortBinding &binding = portIt->second;
-
-          /*
-           * A directly-attached OCS is transparent and schedules the packet
-           * onto the RNIC-facing channel without a second OCS-side
-           * serialization.  An EPS/ToR attachment, however, is a packet
-           * switch and its host-facing egress serialization is part of the
-           * time before the receiver can generate an RDMA ACK.
-           */
-          uint64_t extraNs = binding.linkDelayNs;
-          if (group.type == EPS_AGGREGATED)
-            {
-              extraNs += CalcSerializationNs (m_rnicGatePacketBytes,
-                                              binding.linkBandwidthBps);
-            }
-
-          if (extraNs > maxExtraNs)
-            {
-              maxExtraNs = extraNs;
-            }
-        }
-
-      return maxExtraNs;
-    };
-
   uint64_t commonPeriodNs = 0;
   for (std::map<uint32_t, OcsScheduleConfig>::const_iterator it =
          m_ocsScheduleConfigs.begin ();
@@ -1180,32 +1058,6 @@ TdmController::CompileRnicReachabilityWindows ()
   boundaries.erase (std::unique (boundaries.begin (), boundaries.end ()),
                     boundaries.end ());
 
-  const uint64_t infinity = std::numeric_limits<uint64_t>::max () / 4;
-
-  auto GetDirectedStaticEdgeWeightNs =
-    [&] (uint32_t fromVertex,
-         uint64_t delayNs,
-         uint64_t bandwidthBps,
-         uint32_t packetBytes) -> uint64_t
-    {
-      uint64_t weightNs = delayNs;
-
-      /*
-       * OCS vertices model transparent optical forwarding.  Therefore,
-       * leaving an OCS port only contributes the outgoing channel
-       * propagation delay.  Packet-switch vertices, such as EPS/ToR
-       * switches, must additionally serialize the packet on their
-       * selected egress link.  Source/destination RNIC serialization is
-       * accounted for separately by the endpoint offset helpers.
-       */
-      if (vertexInfo[fromVertex].isPacketSwitch)
-        {
-          weightNs += CalcSerializationNs (packetBytes, bandwidthBps);
-        }
-
-      return weightNs;
-    };
-
   for (uint32_t bi = 0; bi + 1 < boundaries.size (); ++bi)
     {
       uint64_t intervalStartNs = boundaries[bi];
@@ -1217,35 +1069,11 @@ TdmController::CompileRnicReachabilityWindows ()
         }
 
       SimpleDsu dsu (nextVertex);
-      std::vector<std::vector<std::pair<uint32_t, uint64_t> > > dataAdj (nextVertex);
-      std::vector<std::vector<std::pair<uint32_t, uint64_t> > > ackAdj (nextVertex);
 
       for (uint32_t i = 0; i < staticEdges.size (); ++i)
         {
           const WeightedEdge &edge = staticEdges[i];
           dsu.Unite (edge.a, edge.b);
-
-          uint64_t dataAB =
-            GetDirectedStaticEdgeWeightNs (edge.a, edge.delayNs,
-                                           edge.bandwidthBps,
-                                           m_rnicGatePacketBytes);
-          uint64_t dataBA =
-            GetDirectedStaticEdgeWeightNs (edge.b, edge.delayNs,
-                                           edge.bandwidthBps,
-                                           m_rnicGatePacketBytes);
-          uint64_t ackAB =
-            GetDirectedStaticEdgeWeightNs (edge.a, edge.delayNs,
-                                           edge.bandwidthBps,
-                                           m_rnicGateAckBytes);
-          uint64_t ackBA =
-            GetDirectedStaticEdgeWeightNs (edge.b, edge.delayNs,
-                                           edge.bandwidthBps,
-                                           m_rnicGateAckBytes);
-
-          dataAdj[edge.a].push_back (std::make_pair (edge.b, dataAB));
-          dataAdj[edge.b].push_back (std::make_pair (edge.a, dataBA));
-          ackAdj[edge.a].push_back (std::make_pair (edge.b, ackAB));
-          ackAdj[edge.b].push_back (std::make_pair (edge.a, ackBA));
         }
 
       for (uint32_t i = 0; i < m_ocsScheduleEntries.size (); ++i)
@@ -1302,10 +1130,6 @@ TdmController::CompileRnicReachabilityWindows ()
                          "OCS schedule port B has no graph vertex");
 
           dsu.Unite (itA->second, itB->second);
-          dataAdj[itA->second].push_back (std::make_pair (itB->second, 0));
-          dataAdj[itB->second].push_back (std::make_pair (itA->second, 0));
-          ackAdj[itA->second].push_back (std::make_pair (itB->second, 0));
-          ackAdj[itB->second].push_back (std::make_pair (itA->second, 0));
         }
 
       for (std::map<uint32_t, uint32_t>::const_iterator srcIt =
@@ -1316,51 +1140,6 @@ TdmController::CompileRnicReachabilityWindows ()
           uint32_t srcGroup = srcIt->first;
           uint32_t srcVertex = srcIt->second;
 
-          std::map<uint32_t, RnicGroup>::const_iterator srcGroupIt =
-            m_rnicGroups.find (srcGroup);
-          NS_ASSERT_MSG (srcGroupIt != m_rnicGroups.end (),
-                         "source group not found");
-          const RnicGroup &srcGroupObj = srcGroupIt->second;
-
-          uint64_t sourceInjectionOffsetNs =
-            GetEndpointSourceOffsetNs (srcGroupObj, m_rnicGatePacketBytes);
-
-          std::vector<uint64_t> dist (nextVertex, infinity);
-          std::vector<uint32_t> prev (nextVertex, std::numeric_limits<uint32_t>::max ());
-          typedef std::pair<uint64_t, uint32_t> QueueItem;
-          std::priority_queue<QueueItem,
-                              std::vector<QueueItem>,
-                              std::greater<QueueItem> > pq;
-
-          dist[srcVertex] = 0;
-          pq.push (std::make_pair (0, srcVertex));
-
-          while (!pq.empty ())
-            {
-              QueueItem item = pq.top ();
-              pq.pop ();
-
-              uint64_t d = item.first;
-              uint32_t v = item.second;
-
-              if (d != dist[v])
-                {
-                  continue;
-                }
-
-              for (uint32_t ei = 0; ei < dataAdj[v].size (); ++ei)
-                {
-                  uint32_t to = dataAdj[v][ei].first;
-                  uint64_t w = dataAdj[v][ei].second;
-                  if (dist[to] > d + w)
-                    {
-                      dist[to] = d + w;
-                      prev[to] = v;
-                      pq.push (std::make_pair (dist[to], to));
-                    }
-                }
-            }
-
           for (std::map<uint32_t, uint32_t>::const_iterator dstIt =
                  groupToAttachmentVertex.begin ();
                dstIt != groupToAttachmentVertex.end ();
@@ -1368,12 +1147,6 @@ TdmController::CompileRnicReachabilityWindows ()
             {
               uint32_t dstGroup = dstIt->first;
               uint32_t dstVertex = dstIt->second;
-
-              std::map<uint32_t, RnicGroup>::const_iterator dstGroupObjIt =
-                m_rnicGroups.find (dstGroup);
-              NS_ASSERT_MSG (dstGroupObjIt != m_rnicGroups.end (),
-                             "destination group not found");
-              const RnicGroup &dstGroupObj = dstGroupObjIt->second;
 
               /*
                * Keep srcGroup == dstGroup and static-EPS-reachable
@@ -1387,132 +1160,11 @@ TdmController::CompileRnicReachabilityWindows ()
                   continue;
                 }
 
-              if (dist[dstVertex] == infinity)
-                {
-                  continue;
-                }
-
-              std::vector<uint32_t> pathVertices;
-              bool pathComplete = false;
-              uint32_t walk = dstVertex;
-              while (walk != std::numeric_limits<uint32_t>::max ())
-                {
-                  pathVertices.push_back (walk);
-
-                  if (walk == srcVertex)
-                    {
-                      pathComplete = true;
-                      break;
-                    }
-                  walk = prev[walk];
-                }
-
-              if (!pathComplete)
-                {
-                  continue;
-                }
-
-              uint64_t maxDeadlineOffsetNs = 0;
 
               /*
-               * Data-safe constraint: the data packet must reach each OCS on
-               * the forward path before that OCS enters switching time.
+               * The controller exports only the physical path-stable interval.
+               * DATA/ACK timing reserves are calculated at the RNIC at run time.
                */
-              for (uint32_t pv = 0; pv < pathVertices.size (); ++pv)
-                {
-                  uint32_t v = pathVertices[pv];
-                  if (vertexInfo[v].isOcsPort)
-                    {
-                      uint64_t dataArrivalOffsetNs = sourceInjectionOffsetNs + dist[v];
-                      if (dataArrivalOffsetNs > maxDeadlineOffsetNs)
-                        {
-                          maxDeadlineOffsetNs = dataArrivalOffsetNs;
-                        }
-                    }
-                }
-
-              /*
-               * ACK-safe / completion-safe constraint: after the data packet
-               * reaches the destination RNIC, the receiver-side ACK must also
-               * reach each OCS on the reverse path before the circuit becomes
-               * invalid.  The ACK itself is not separately gated here; instead
-               * the sender-side data injection deadline is pulled earlier.
-               *
-               * The reverse path uses ACK-sized directed edge weights.  Packet
-               * switches contribute egress serialization, while OCS ports remain
-               * transparent and contribute only channel propagation.
-               */
-              uint64_t dstDataDeliveryExtraNs =
-                GetEndpointDataDeliveryExtraNs (dstGroupObj);
-              uint64_t dstAckSourceOffsetNs =
-                GetEndpointSourceOffsetNs (dstGroupObj, m_rnicGateAckBytes);
-              uint64_t dataForwardToDstNs =
-                sourceInjectionOffsetNs + dist[dstVertex] + dstDataDeliveryExtraNs;
-
-              std::vector<uint64_t> reverseDist (nextVertex, infinity);
-              typedef std::pair<uint64_t, uint32_t> ReverseQueueItem;
-              std::priority_queue<ReverseQueueItem,
-                                  std::vector<ReverseQueueItem>,
-                                  std::greater<ReverseQueueItem> > reversePq;
-
-              reverseDist[dstVertex] = 0;
-              reversePq.push (std::make_pair (0, dstVertex));
-
-              while (!reversePq.empty ())
-                {
-                  ReverseQueueItem item = reversePq.top ();
-                  reversePq.pop ();
-
-                  uint64_t d = item.first;
-                  uint32_t v = item.second;
-
-                  if (d != reverseDist[v])
-                    {
-                      continue;
-                    }
-
-                  for (uint32_t ei = 0; ei < ackAdj[v].size (); ++ei)
-                    {
-                      uint32_t to = ackAdj[v][ei].first;
-                      uint64_t w = ackAdj[v][ei].second;
-                      if (reverseDist[to] > d + w)
-                        {
-                          reverseDist[to] = d + w;
-                          reversePq.push (std::make_pair (reverseDist[to], to));
-                        }
-                    }
-                }
-
-              for (uint32_t pv = 0; pv < pathVertices.size (); ++pv)
-                {
-                  uint32_t v = pathVertices[pv];
-                  if (vertexInfo[v].isOcsPort && reverseDist[v] != infinity)
-                    {
-                      uint64_t ackArrivalOffsetNs =
-                        dataForwardToDstNs + dstAckSourceOffsetNs + reverseDist[v];
-                      if (ackArrivalOffsetNs > maxDeadlineOffsetNs)
-                        {
-                          maxDeadlineOffsetNs = ackArrivalOffsetNs;
-                        }
-                    }
-                }
-
-              uint64_t latestInjectNs = intervalEndNs;
-
-              if (maxDeadlineOffsetNs > 0)
-                {
-                  if (intervalEndNs <= maxDeadlineOffsetNs)
-                    {
-                      continue;
-                    }
-
-                  latestInjectNs = intervalEndNs - maxDeadlineOffsetNs;
-                }
-
-              if (latestInjectNs <= intervalStartNs)
-                {
-                  continue;
-                }
 
               RnicReachabilityWindow window;
               window.srcGroup = srcGroup;
@@ -1520,7 +1172,7 @@ TdmController::CompileRnicReachabilityWindows ()
               window.ocsId = std::numeric_limits<uint32_t>::max ();
               window.slice = bi;
               window.startOffset = NanoSeconds (intervalStartNs);
-              window.endOffset = NanoSeconds (latestInjectNs);
+              window.endOffset = NanoSeconds (intervalEndNs);
               window.period = NanoSeconds (commonPeriodNs);
 
               m_rnicReachabilityWindows.push_back (window);
@@ -1721,9 +1373,6 @@ TdmController::InstallRnicGateTablesToRdmaHw () const
 
   std::map<RnicEndpointKey, std::vector<GateSlot> > tables;
 
-  std::map<RnicEndpointKey, uint64_t> tableMaxExtraGuardNs;
-  std::map<RnicEndpointKey, uint64_t> tableMinBottleneckBps;
-
   for (uint32_t i = 0; i < m_rnicReachabilityWindows.size (); ++i)
     {
       const RnicReachabilityWindow &w = m_rnicReachabilityWindows[i];
@@ -1737,85 +1386,12 @@ TdmController::InstallRnicGateTablesToRdmaHw () const
       uint64_t periodNs =
         static_cast<uint64_t> (w.period.GetNanoSeconds ());
 
-      uint64_t bottleneckBps = std::numeric_limits<uint64_t>::max ();
-      bool haveBottleneck = false;
-
-      for (uint32_t rn = 0; rn < srcGroup.endpoints.size (); ++rn)
-        {
-          const RnicEndpoint &endpoint = srcGroup.endpoints[rn];
-          std::map<uint32_t, std::map<uint32_t, PortBinding> >::const_iterator nodeIt =
-            m_portBindings.find (endpoint.nodeId);
-          if (nodeIt == m_portBindings.end ())
-            {
-              continue;
-            }
-          std::map<uint32_t, PortBinding>::const_iterator portIt =
-            nodeIt->second.find (endpoint.rnicPortId);
-          if (portIt != nodeIt->second.end () &&
-              portIt->second.linkBandwidthBps > 0)
-            {
-              bottleneckBps = std::min (bottleneckBps,
-                                        portIt->second.linkBandwidthBps);
-              haveBottleneck = true;
-            }
-        }
-
-      std::map<uint32_t, std::map<uint32_t, PortBinding> >::const_iterator attachIt =
-        m_portBindings.find (srcGroup.attachmentNode);
-      if (attachIt != m_portBindings.end ())
-        {
-          for (std::map<uint32_t, PortBinding>::const_iterator pb =
-                 attachIt->second.begin ();
-               pb != attachIt->second.end ();
-               ++pb)
-            {
-              if (IsOcsNode (pb->second.peerNodeId) &&
-                  pb->second.linkBandwidthBps > 0)
-                {
-                  bottleneckBps = std::min (bottleneckBps,
-                                            pb->second.linkBandwidthBps);
-                  haveBottleneck = true;
-                }
-            }
-        }
-
-      uint64_t drainGuardNs = 0;
-      if (haveBottleneck && bottleneckBps > 0 && m_rnicGateBurstBytes > 0)
-        {
-          long double numerator =
-            static_cast<long double> (m_rnicGateBurstBytes) *
-            8.0L * 1000000000.0L;
-          drainGuardNs = static_cast<uint64_t>
-            (std::ceil (numerator / static_cast<long double> (bottleneckBps)));
-        }
-
-      uint64_t extraTailGuardNs = m_rnicGateExtraMarginNs + drainGuardNs;
-      if (endOffsetNs <= startOffsetNs + extraTailGuardNs)
-        {
-          continue;
-        }
-      endOffsetNs -= extraTailGuardNs;
-
       for (uint32_t sidx = 0; sidx < srcGroup.endpoints.size (); ++sidx)
         {
           const RnicEndpoint &src = srcGroup.endpoints[sidx];
           RnicEndpointKey key = std::make_pair (src.nodeId, src.rnicPortId);
           std::vector<GateSlot> &slots = tables[key];
 
-          tableMaxExtraGuardNs[key] =
-            std::max (tableMaxExtraGuardNs[key], extraTailGuardNs);
-          if (haveBottleneck)
-            {
-              if (tableMinBottleneckBps.find (key) == tableMinBottleneckBps.end ())
-                {
-                  tableMinBottleneckBps[key] = bottleneckBps;
-                }
-              else
-                {
-                  tableMinBottleneckBps[key] =
-                    std::min (tableMinBottleneckBps[key], bottleneckBps);
-                }
-            }
 
           GateSlot *slot = 0;
           for (uint32_t k = 0; k < slots.size (); ++k)
@@ -1922,7 +1498,6 @@ TdmController::InstallRnicGateTablesToRdmaHw () const
       it->second = normalized;
     }
 
-  bool printedGuardSummary = false;
   uint32_t installedCount = 0;
   uint32_t maxSlots = 0;
   uint64_t summaryPeriodNs = 0;
@@ -1988,24 +1563,6 @@ TdmController::InstallRnicGateTablesToRdmaHw () const
                     << " destinations="
                     << FormatDestinationBitmap (hwSlots[k].dstRnicBitmapWords)
                     << std::endl;
-        }
-
-      uint64_t loggedExtraGuardNs = tableMaxExtraGuardNs[key];
-      uint64_t loggedBottleneckBps = tableMinBottleneckBps[key];
-      uint64_t loggedDrainGuardNs =
-        loggedExtraGuardNs > m_rnicGateExtraMarginNs
-          ? loggedExtraGuardNs - m_rnicGateExtraMarginNs
-          : 0;
-      if (!printedGuardSummary)
-        {
-          std::cout << "[RNIC GATE GUARD]"
-                    << " guardNs=" << loggedExtraGuardNs
-                    << " marginNs=" << m_rnicGateExtraMarginNs
-                    << " burstBytes=" << m_rnicGateBurstBytes
-                    << " drainGuardNs=" << loggedDrainGuardNs
-                    << " guardLinkRateBps=" << loggedBottleneckBps
-                    << std::endl;
-          printedGuardSummary = true;
         }
 
       transport->InstallGateTable (

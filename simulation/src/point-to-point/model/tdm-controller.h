@@ -49,10 +49,6 @@ public:
                        uint64_t linkDelayNs,
                        uint64_t linkBandwidthBps);
 
-  void SetRnicGatePacketBytes (uint32_t packetBytes);
-  void SetRnicGateAckBytes (uint32_t packetBytes);
-  void SetRnicGateExtraMarginNs (uint64_t marginNs);
-  void SetRnicGateBurstBytes (uint64_t burstBytes);
 
   // Centralized OCS/TDM schedule input and data-plane programming.
   void LoadStaticMap (const std::string &filename);
@@ -242,10 +238,6 @@ private:
   // For RNIC_DIRECT_OCS: attachment node is the RNIC node itself.
   std::map<uint32_t, uint32_t> m_attachmentNodeToRnicGroup;
 
-  uint32_t m_rnicGatePacketBytes;
-  uint32_t m_rnicGateAckBytes;
-  uint64_t m_rnicGateExtraMarginNs;
-  uint64_t m_rnicGateBurstBytes;
 
   std::vector<RnicReachabilityWindow> m_rnicReachabilityWindows;
 };

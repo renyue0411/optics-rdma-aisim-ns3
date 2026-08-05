@@ -26,6 +26,22 @@ public:
 	uint64_t m_retransBytes;
 	uint64_t m_nackCount;
 	uint64_t m_timeoutCount;
+
+	// Mode-1 ACK RTT estimator. One first-transmission sample is tracked per QP.
+	bool m_deadlineSampleOutstanding;
+	uint64_t m_deadlineSampleSeq;
+	uint64_t m_deadlineSampleTxNs;
+	uint64_t m_deadlineSrttNs;
+	uint64_t m_deadlineRttVarNs;
+	uint32_t m_deadlineValidSamples;
+	uint64_t m_deadlineCheckCount;
+	uint64_t m_deadlineAllowedCheckCount;
+	uint64_t m_deadlineBlockedCheckCount;
+	uint64_t m_deadlineBlockEventCount;
+	uint64_t m_deadlineLastBlockedWindowEndNs;
+	uint64_t m_deadlineLastPacketSeq;
+	uint64_t m_deadlineLastPacketEndSeq;
+	bool m_deadlineLastPacketWasRetransmission;
 	uint16_t m_pg;
 	uint16_t m_ipid;
 	uint32_t m_win; // bound of on-the-fly packets

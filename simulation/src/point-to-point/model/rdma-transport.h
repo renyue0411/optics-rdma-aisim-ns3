@@ -11,6 +11,14 @@
 #include <vector>
 #include <stdint.h>
 
+// MODE2_CQE_SEMANTICS_V1: userspace observes WR completions, not transport ACKs.
+// MODE2_INJECTION_WINDOW_PIPELINE_V1: OCS admission preserves multi-WR pipeline capacity.
+// MODE2_OPTIMIZED_GUARD_V1: stable-end + CQE-jitter userspace safety boundary.
+// MODE2_PER_PORT_TIMING_V1: isolate Mode-2 rate/CQE state by breakout RNIC port.
+// MODE2_PER_PORT_AGGREGATE_ADMISSION_V1: account all in-flight WR bytes per breakout port.
+// MODE2_PORT_QP_LOGGING_V1: separate configured QP hint from runtime per-port QP count.
+// MODE2_DEFAULT_PIPELINE_V1: default Mode 2 uses a fixed-depth WR/CQE pipeline.
+
 namespace ns3 {
 
 class RdmaTransport : public Object
@@ -30,6 +38,12 @@ public:
         MODE_USERSPACE = 2
     };
 
+    enum UserspaceAdmissionMode
+    {
+        USERSPACE_DEFAULT_PIPELINE = 0,
+        USERSPACE_OCS_WINDOWED = 1
+    };
+
     struct GateSlotEntry
     {
         uint64_t startOffsetNs;
@@ -39,6 +53,10 @@ public:
 
     void SetMode(uint32_t mode);
     GateMode GetMode() const;
+
+    void SetUserspaceAdmissionMode(uint32_t mode);
+    UserspaceAdmissionMode GetUserspaceAdmissionMode() const;
+
     void SetEnabled(bool enabled); // compatibility helper; SetMode() is preferred
 
     void Configure(
@@ -68,8 +86,18 @@ public:
     void ClearGateTables();
 
     void RegisterQp(Ptr<RdmaQueuePair> qp);
-    void NotifyAckProgress(Ptr<RdmaQueuePair> qp);
-    void NotifyRecover(Ptr<RdmaQueuePair> qp);
+
+    // Completion corresponding to one signaled WR/CQE.
+    void NotifyWrCompletion(
+        Ptr<RdmaQueuePair> qp,
+        uint64_t wrId,
+        uint64_t bytes,
+        uint64_t postTimeNs,
+        uint64_t completionTimeNs);
+
+    // Final QP completion is delivered after all completed WR boundaries have
+    // generated CQE-equivalent notifications.
+    void NotifyQpComplete(Ptr<RdmaQueuePair> qp);
 
 private:
     struct GateLookupResult
@@ -88,6 +116,50 @@ private:
         }
     };
 
+    struct UserspacePortState
+    {
+        uint32_t rnicPort;
+        uint32_t planeId;
+        uint32_t ifIndex;
+        uint64_t bottleneckRateBps;
+        uint64_t minSafeRateBps;
+        uint64_t safeRateBps;
+        uint64_t maxSafeRateBps;
+        uint64_t cqeLatencySrttNs;
+        uint64_t cqeLatencyRttvarNs;
+        uint64_t cqeTimingSamples;
+        uint64_t aggregateOutstandingBytes;
+        uint64_t aggregateAdmissionBlockEvents;
+        uint32_t registeredQpCount;
+        uint64_t lastAdaptNs;
+        uint32_t stableAdaptPeriods;
+        bool recoverySinceLastAdapt;
+        bool wrCompletionSinceLastAdapt;
+        bool backlogSinceLastAdapt;
+
+        UserspacePortState()
+            : rnicPort(0),
+              planeId(0),
+              ifIndex(0),
+              bottleneckRateBps(0),
+              minSafeRateBps(0),
+              safeRateBps(0),
+              maxSafeRateBps(0),
+              cqeLatencySrttNs(0),
+              cqeLatencyRttvarNs(0),
+              cqeTimingSamples(0),
+              aggregateOutstandingBytes(0),
+              aggregateAdmissionBlockEvents(0),
+              registeredQpCount(0),
+              lastAdaptNs(0),
+              stableAdaptPeriods(0),
+              recoverySinceLastAdapt(false),
+              wrCompletionSinceLastAdapt(false),
+              backlogSinceLastAdapt(false)
+        {
+        }
+    };
+
     GateLookupResult LookupGate(
         Ptr<RdmaQueuePair> qp,
         Time now) const;
@@ -102,13 +174,39 @@ private:
 
     void TrySubmit(Ptr<RdmaQueuePair> qp);
 
+    void TrySubmitDefaultPipeline(Ptr<RdmaQueuePair> qp);
+
+    void TrySubmitOcsWindowed(Ptr<RdmaQueuePair> qp);
+
     void ScheduleNextWake(
         Ptr<RdmaQueuePair> qp,
         Time wakeTime);
 
     uint64_t GetSafeBudgetBytes(
+        Ptr<RdmaQueuePair> qp,
         const GateLookupResult& gate,
-        Time now) const;
+        Time now);
+
+    UserspacePortState& GetUserspacePortState(
+        Ptr<RdmaQueuePair> qp,
+        const char* reason);
+
+    const UserspacePortState* FindUserspacePortState(
+        Ptr<RdmaQueuePair> qp) const;
+
+    void SchedulePortQpWakeups(
+        Ptr<RdmaQueuePair> triggerQp);
+
+    uint64_t GetPortBottleneckRateBps(
+        Ptr<RdmaQueuePair> qp) const;
+
+    uint64_t GetUserspaceTailGuardNs(
+        Ptr<RdmaQueuePair> qp,
+        const UserspacePortState& portState) const;
+
+    void UpdateCqeTimingModel(
+        Ptr<RdmaQueuePair> qp,
+        uint64_t completionLatencyNs);
 
     void MaybeAdapt(Ptr<RdmaQueuePair> qp);
 
@@ -133,19 +231,40 @@ private:
     void RecordPost(
         Ptr<RdmaQueuePair> qp,
         uint64_t bytes,
-        uint64_t safeBudget,
+        uint64_t windowBudget,
+        uint64_t admissionBudget,
         Time windowEnd);
 
     void FlushPostSummary(
         Ptr<RdmaQueuePair> qp);
+
+    struct UserspaceQpState
+    {
+        uint64_t postedBytes;
+        uint64_t completedBytes;
+        uint64_t outstandingBytes;
+        uint64_t lastAggregateBlockWindowEndNs;
+
+        UserspaceQpState()
+            : postedBytes(0),
+              completedBytes(0),
+              outstandingBytes(0),
+              lastAggregateBlockWindowEndNs(0)
+        {
+        }
+    };
+
+    UserspaceQpState& GetUserspaceQpState(Ptr<RdmaQueuePair> qp);
+    uint64_t GetUserspaceOutstandingBytes(Ptr<RdmaQueuePair> qp) const;
 
 private:
     Ptr<Node> m_node;
     Ptr<RdmaHw> m_rdma;
 
     GateMode m_mode;
-    bool m_enabled; // userspace admission active only in MODE_USERSPACE
+    bool m_enabled; // Mode-2 userspace transport active only in MODE_USERSPACE
     bool m_gateEnabled;
+    UserspaceAdmissionMode m_userspaceAdmissionMode;
 
     struct GateTable
     {
@@ -165,6 +284,10 @@ private:
     uint64_t m_tailGuardNs;
     uint64_t m_minPostBytes;
 
+    // Shared userspace execution margin. Link-rate and CQE timing state are
+    // maintained per breakout RNIC port in m_userspacePortStates.
+    uint64_t m_userspaceSoftwareGuardNs;
+
     // Deterministic adaptive admission state.
     // These are runtime parameters for mode-2 userspace WR admission.
     uint64_t m_minSafeRateBps;
@@ -174,11 +297,6 @@ private:
     uint64_t m_minOutstandingBytes;
     uint64_t m_maxOutstandingCeilingBytes;
     uint64_t m_adaptPeriodNs;
-    uint64_t m_lastAdaptNs;
-    uint32_t m_stableAdaptPeriods;
-    bool m_recoverySinceLastAdapt;
-    bool m_ackProgressSinceLastAdapt;
-    bool m_backlogSinceLastAdapt;
 
     // Bandwidth-normalized initialization state.  These fields avoid
     // 50G-specific constants and allow the same code to scale to 100G/200G/400G.
@@ -198,6 +316,12 @@ private:
         uint64_t firstPostTimeNs;
         uint64_t lastPostTimeNs;
         uint64_t safeBudgetLimitedCount;
+        uint64_t completionCount;
+        uint64_t completedBytes;
+        uint64_t totalCompletionLatencyNs;
+        uint64_t minCompletionLatencyNs;
+        uint64_t maxCompletionLatencyNs;
+        uint64_t lastCompletedWrId;
         uint32_t sampleCount;
 
         PostStats()
@@ -208,12 +332,21 @@ private:
               firstPostTimeNs(0),
               lastPostTimeNs(0),
               safeBudgetLimitedCount(0),
+              completionCount(0),
+              completedBytes(0),
+              totalCompletionLatencyNs(0),
+              minCompletionLatencyNs(0),
+              maxCompletionLatencyNs(0),
+              lastCompletedWrId(0),
               sampleCount(0)
         {
         }
     };
 
     std::map<uint64_t, PostStats> m_postStats;
+    std::map<uint64_t, UserspaceQpState> m_userspaceQpStates;
+    std::map<uint64_t, Ptr<RdmaQueuePair> > m_userspaceRegisteredQps;
+    std::map<uint32_t, UserspacePortState> m_userspacePortStates;
     uint32_t m_postLogSampleLimit;
 };
 

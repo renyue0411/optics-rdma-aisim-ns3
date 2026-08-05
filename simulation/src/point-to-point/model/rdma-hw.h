@@ -8,8 +8,11 @@
 #include "qbb-net-device.h"
 #include <unordered_map>
 #include <map>
+#include <deque>
 #include <set>
 #include "pint.h"
+
+// MODE2_CQE_SEMANTICS_V1: RNIC keeps signaled-WR boundaries internally.
 
 namespace ns3 {
 
@@ -79,6 +82,14 @@ public:
 	typedef Callback<Time, Ptr<RdmaQueuePair> > RnicGateNextTimeCallback;
 	RnicGateAllowCallback m_rnicGateAllowCallback;
 	RnicGateNextTimeCallback m_rnicGateNextTimeCallback;
+
+	// Mode-1 dynamic deadline configuration. Values are in nanoseconds.
+	bool m_rnicDeadlineEnabled;
+	uint64_t m_rnicDeadlinePipelineGuardNs;
+	uint64_t m_rnicDeadlineClockGuardNs;
+	uint64_t m_rnicDeadlineInitialGuardNs;
+	uint32_t m_rnicDeadlineMinRttSamples;
+	uint32_t m_rnicDeadlineRttVarMultiplier;
 	uint32_t m_gpus_per_server; // uesed for routing; if src and dst in the same server, then communicate by nvswitch.
 	uint32_t nvls_enable;
 	std::set<uint32_t> nvswitch_set;
@@ -90,8 +101,22 @@ public:
     SendCompleteCallback m_sendCompleteCallback;
 	typedef Callback<void, Ptr<RdmaQueuePair> > QpProgressCallback;
 	typedef Callback<void, Ptr<RdmaQueuePair> > QpRecoverCallback;
-	QpProgressCallback m_qpProgressCallback;
-	QpRecoverCallback m_qpRecoverCallback;
+	typedef Callback<void, Ptr<RdmaQueuePair>, uint64_t, uint64_t, uint64_t, uint64_t>
+		WrCompletionCallback;
+
+	struct PostedWrRecord
+	{
+		uint64_t wrId;
+		uint64_t endSeq;
+		uint64_t bytes;
+		uint64_t postTimeNs;
+	};
+
+	QpProgressCallback m_qpProgressCallback; // compatibility only
+	QpRecoverCallback m_qpRecoverCallback;   // compatibility only
+	WrCompletionCallback m_wrCompletionCallback;
+	std::map<uint64_t, std::deque<PostedWrRecord> > m_postedWrRecords;
+	std::map<uint64_t, uint64_t> m_nextWrId;
 
     // for monitor
 	std::vector<uint64_t> tx_bytes; // <port_id, tx_bytes>
@@ -149,11 +174,23 @@ public:
 	void Setup(QpCompleteCallback cb,SendCompleteCallback send_cb);
 	void SetQpProgressCallback(QpProgressCallback cb);
 	void SetQpRecoverCallback(QpRecoverCallback cb);
+	void SetWrCompletionCallback(WrCompletionCallback cb);
+	void GenerateWrCompletions(Ptr<RdmaQueuePair> qp);
 	void SetRnicGateCallbacks(RnicGateAllowCallback allowCb,
 	                          RnicGateNextTimeCallback nextTimeCb);
 	void ClearRnicGateCallbacks();
 	bool RnicGateAllowsQp(Ptr<RdmaQueuePair> qp) const;
-	Time GetNextRnicGateTime(Ptr<RdmaQueuePair> qp) const; // setup shared data and callbacks with the QbbNetDevice
+	Time GetNextRnicGateTime(Ptr<RdmaQueuePair> qp) const;
+	void ConfigureRnicDeadline(bool enabled,
+	                           uint64_t pipelineGuardNs,
+	                           uint64_t clockGuardNs,
+	                           uint64_t initialGuardNs,
+	                           uint32_t minRttSamples,
+	                           uint32_t rttVarMultiplier);
+	bool IsRnicDeadlineEnabled() const;
+	uint64_t GetRnicDeadlineReserveNs(Ptr<RdmaQueuePair> qp) const;
+	void UpdateRnicDeadlineRtt(Ptr<RdmaQueuePair> qp, uint64_t ackSeq);
+	void InvalidateRnicDeadlineSample(Ptr<RdmaQueuePair> qp); // setup shared data and callbacks with the QbbNetDevice
 	static uint64_t GetQpKey(uint32_t dip, uint16_t sport, uint16_t pg); // get the lookup key for m_qpMap
 	Ptr<RdmaQueuePair> GetQp(uint32_t dip, uint16_t sport, uint16_t pg); // get the qp
 	uint32_t GetNicIdxOfQp(Ptr<RdmaQueuePair> qp); // get the NIC index of the qp
