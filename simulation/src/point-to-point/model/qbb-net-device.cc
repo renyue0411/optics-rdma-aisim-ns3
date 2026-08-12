@@ -49,6 +49,7 @@
 #include "ns3/custom-header.h"
 #include <iostream>
 // MODE1_CONTINUATION_ACK_RECOVERY_V1: gate may grant one bounded window bypass.
+// MODE1_FINAL_ACK_RECOVERY_V1: a final-outstanding QP may emit one tail probe.
 NS_LOG_COMPONENT_DEFINE("QbbNetDevice");
 
 namespace ns3 {
@@ -109,6 +110,10 @@ namespace ns3 {
 			// iterate start behind the m_rrlast qp
 			uint32_t idx = (qIndex + m_rrlast) % fcount;
 			Ptr<RdmaQueuePair> qp = m_qpGrp->Get(idx);
+			if (qp->m_qpError){
+				min_finish_id = idx < min_finish_id ? idx : min_finish_id;
+				continue;
+			}
 			if(qp->GetBytesLeft()<=0){
 				int sender_node = qp->GetSrc();
 				int receiver_node = qp->GetDest();
@@ -116,14 +121,18 @@ namespace ns3 {
 				int t_count = qp->GetInitialSize();
 				// qp transmission finished
 			}
-			if (!paused[qp->m_pg] && qp->GetBytesLeft() > 0){
+			const bool hasNewData = qp->GetBytesLeft() > 0;
+			const bool hasFinalOutstanding =
+				!hasNewData &&
+				!m_rdmaGateAllowQp.IsNull() &&
+				qp->snd_una < qp->m_highestSentSeq;
+			if (!paused[qp->m_pg] && (hasNewData || hasFinalOutstanding)){
 				if (m_qpGrp->Get(idx)->m_nextAvail.GetTimeStep() > Simulator::Now().GetTimeStep()) //not available now
 					continue;
 
 				// Consult the Mode-1 gate even when the ordinary transport window
-				// is full.  The gate may grant one next-window continuation
-				// packet; without that explicit permit, IsWinBound() remains
-				// authoritative for all modes.
+				// is full or all new DATA has already been sent. The gate may grant
+				// one continuation packet or one oldest-unacknowledged tail probe.
 				if (!m_rdmaGateAllowQp.IsNull() && !m_rdmaGateAllowQp(qp)){
 					if (!m_rdmaGateNextTime.IsNull()){
 						Time t = m_rdmaGateNextTime(qp);
@@ -134,7 +143,13 @@ namespace ns3 {
 					continue;
 				}
 
-				if (qp->IsWinBound() && !qp->m_ackRecoveryPermit){
+				const bool tailPermit =
+					qp->m_ackRecoveryPermit &&
+					qp->m_ackRecoveryPermitType == RNIC_ACK_PROBE_TAIL;
+				if (!hasNewData && !tailPermit){
+					continue;
+				}
+				if (hasNewData && qp->IsWinBound() && !qp->m_ackRecoveryPermit){
 					continue;
 				}
 
@@ -149,7 +164,7 @@ namespace ns3 {
 		if (min_finish_id < 0xffffffff){
 			int nxt = min_finish_id;
 			auto &qps = m_qpGrp->m_qps;
-			for (int i = min_finish_id + 1; i < fcount; i++) if (!qps[i]->IsFinished()){
+			for (int i = min_finish_id + 1; i < fcount; i++) if (!qps[i]->IsFinished() && !qps[i]->m_qpError){
 				if (i == res) // update res to the idx after removing finished qp
 					res = nxt;
 				qps[nxt] = qps[i];

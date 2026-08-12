@@ -1,6 +1,8 @@
 #include "rdma-driver.h"
 
 // MODE2_CQE_SEMANTICS_V1: bind userspace to WR completions, not ACK progress.
+// MODE2_VERBS_COMPLETION_V2: userspace operation completion is owned by final signaled-WR CQE.
+// MODE2_VERBS_ERROR_CQE_V1: Mode 2 reports CQE failure separately from success.
 
 namespace ns3 {
 
@@ -14,6 +16,9 @@ TypeId RdmaDriver::GetTypeId (void)
 		.AddTraceSource ("QpComplete", "A qp completes.",
 				MakeTraceSourceAccessor (&RdmaDriver::m_traceQpComplete),
 				"ns3::RdmaDriver::QpComplete")
+		.AddTraceSource ("QpError", "A userspace-visible QP operation fails.",
+				MakeTraceSourceAccessor (&RdmaDriver::m_traceQpError),
+				"ns3::RdmaDriver::QpError")
 		.AddTraceSource(
 				"SendComplete",
 				"A qp Send completes.",
@@ -61,9 +66,12 @@ void RdmaDriver::Init(void){
 	m_transport = CreateObject<RdmaTransport>();
 	m_transport->SetNode(m_node);
 	m_transport->SetRdmaHw(m_rdma);
-	// Equivalent to a dedicated userspace CQ busy-poll loop.
+	// Equivalent to a dedicated userspace CQ busy-poll loop. Keep the
+	// callback at the driver boundary so Mode 2 can translate the final CQE
+	// into the userspace-visible operation-complete event without exposing
+	// RNIC ACK/PSN state to RdmaTransport.
 	m_rdma->SetWrCompletionCallback(
-		MakeCallback(&RdmaTransport::NotifyWrCompletion, m_transport));
+		MakeCallback(&RdmaDriver::WrComplete, this));
 }
 
 void RdmaDriver::SetNode(Ptr<Node> node){
@@ -99,7 +107,48 @@ void RdmaDriver::QpComplete(Ptr<RdmaQueuePair> q)
         m_transport->NotifyQpComplete(q);
     }
 
-    m_traceQpComplete(q);
+    // Mode 2 exposes completion at the verbs boundary: the final signaled WR
+    // CQE, not the later RNIC-internal QP teardown callback. Modes 0/1 retain
+    // the legacy QP-complete trace semantics.
+    if (m_injectionMode != INJECTION_USERSPACE)
+    {
+        m_traceQpComplete(q);
+    }
+}
+
+void RdmaDriver::WrComplete(Ptr<RdmaQueuePair> q,
+                            uint64_t wrId,
+                            uint64_t bytes,
+                            uint64_t postTimeNs,
+                            uint64_t completionTimeNs,
+                            uint32_t cqeStatus)
+{
+    if (m_transport == NULL)
+    {
+        return;
+    }
+
+    const RdmaTransport::UserspaceCompletionResult result =
+        m_transport->NotifyWrCompletion(
+            q, wrId, bytes, postTimeNs, completionTimeNs, cqeStatus);
+    if (m_injectionMode != INJECTION_USERSPACE)
+    {
+        return;
+    }
+
+    if (result == RdmaTransport::USERSPACE_COMPLETION_SUCCESS)
+    {
+        // Preserve the existing success trace/callback contract while making
+        // its Mode-2 meaning match ibv_poll_cq(): the operation is complete
+        // when the final signaled WR CQE has been observed by userspace.
+        m_traceQpComplete(q);
+    }
+    else if (result == RdmaTransport::USERSPACE_COMPLETION_ERROR)
+    {
+        // Do not reuse the success trace for failures.  A real verbs consumer
+        // distinguishes these outcomes using wc.status.
+        m_traceQpError(q, cqeStatus);
+    }
 }
 
 void RdmaDriver::SendComplete(Ptr<RdmaQueuePair> q){

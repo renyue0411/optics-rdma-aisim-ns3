@@ -12,6 +12,8 @@
 #include <stdint.h>
 
 // MODE2_CQE_SEMANTICS_V1: userspace observes WR completions, not transport ACKs.
+// MODE2_VERBS_COMPLETION_V2: userspace operation completion is owned by final signaled-WR CQE.
+// MODE2_VERBS_ERROR_CQE_V1: userspace failure is observed only through CQE status.
 // MODE2_INJECTION_WINDOW_PIPELINE_V1: OCS admission preserves multi-WR pipeline capacity.
 // MODE2_OPTIMIZED_GUARD_V1: stable-end + CQE-jitter userspace safety boundary.
 // MODE2_PER_PORT_TIMING_V1: isolate Mode-2 rate/CQE state by breakout RNIC port.
@@ -19,6 +21,7 @@
 // MODE2_PORT_QP_LOGGING_V1: separate configured QP hint from runtime per-port QP count.
 // MODE2_DEFAULT_PIPELINE_V1: default Mode 2 uses a fixed-depth WR/CQE pipeline.
 // MODE1_CONTINUATION_ACK_RECOVERY_V1: bounded next-window DATA probing.
+// MODE1_FINAL_ACK_RECOVERY_V1: receiver-window flush plus final-tail probing.
 
 namespace ns3 {
 
@@ -45,6 +48,13 @@ public:
         USERSPACE_OCS_WINDOWED = 1
     };
 
+    enum UserspaceCompletionResult
+    {
+        USERSPACE_COMPLETION_NONE = 0,
+        USERSPACE_COMPLETION_SUCCESS = 1,
+        USERSPACE_COMPLETION_ERROR = 2
+    };
+
     struct GateSlotEntry
     {
         uint64_t startOffsetNs;
@@ -64,6 +74,10 @@ public:
         uint64_t wrChunkBytes,
         uint64_t maxOutstandingBytes);
 
+    void ConfigureRnicAckFlush(
+        bool enabled,
+        uint64_t guardNs);
+
     // Bandwidth-normalized initialization for mode-2 userspace admission.
     // If bottleneckRateBps/switchingGuardNs/maxRttNs are zero, the transport
     // infers conservative defaults from the local RNIC and installed gate table.
@@ -73,6 +87,15 @@ public:
         uint64_t maxRttNs,
         uint32_t activeQpHint,
         bool realDeploymentMode);
+
+    // Mode-2 userspace cannot read RNIC/path RTT state.  This configurable
+    // bootstrap estimate is used only until success CQEs provide an observable
+    // completion-latency SRTT/RTTVAR.
+    void ConfigureUserspaceInitialRtt(uint64_t initialRttNs);
+
+    // Optional userspace policy override for the minimum OCS tail guard.
+    // Zero preserves the deployment-mode default; positive values are explicit.
+    void ConfigureUserspaceMinTailGuard(uint64_t minTailGuardNs);
 
     void InstallGateTable(
         uint32_t rnicId,
@@ -88,13 +111,16 @@ public:
 
     void RegisterQp(Ptr<RdmaQueuePair> qp);
 
-    // Completion corresponding to one signaled WR/CQE.
-    void NotifyWrCompletion(
+    // Completion corresponding to one signaled WR/CQE. Status is the only
+    // reliability/error information visible above the simulated verbs boundary.
+    // The return value is terminal exactly once for success or failure.
+    UserspaceCompletionResult NotifyWrCompletion(
         Ptr<RdmaQueuePair> qp,
         uint64_t wrId,
         uint64_t bytes,
         uint64_t postTimeNs,
-        uint64_t completionTimeNs);
+        uint64_t completionTimeNs,
+        uint32_t cqeStatus);
 
     // Final QP completion is delivered after all completed WR boundaries have
     // generated CQE-equivalent notifications.
@@ -131,11 +157,14 @@ private:
         uint64_t cqeLatencySrttNs;
         uint64_t cqeLatencyRttvarNs;
         uint64_t cqeTimingSamples;
+        uint64_t cqeAnomalyPenaltyNs;
+        uint64_t cqeAnomalyCount;
         uint64_t aggregateOutstandingBytes;
         uint64_t aggregateAdmissionBlockEvents;
         uint32_t registeredQpCount;
         uint64_t lastAdaptNs;
         uint32_t stableAdaptPeriods;
+        bool cqeAnomalySinceLastAdapt;
         bool recoverySinceLastAdapt;
         bool wrCompletionSinceLastAdapt;
         bool backlogSinceLastAdapt;
@@ -151,11 +180,14 @@ private:
               cqeLatencySrttNs(0),
               cqeLatencyRttvarNs(0),
               cqeTimingSamples(0),
+              cqeAnomalyPenaltyNs(0),
+              cqeAnomalyCount(0),
               aggregateOutstandingBytes(0),
               aggregateAdmissionBlockEvents(0),
               registeredQpCount(0),
               lastAdaptNs(0),
               stableAdaptPeriods(0),
+              cqeAnomalySinceLastAdapt(false),
               recoverySinceLastAdapt(false),
               wrCompletionSinceLastAdapt(false),
               backlogSinceLastAdapt(false)
@@ -176,10 +208,27 @@ private:
         const GateLookupResult& gate,
         const char* reason) const;
 
-    bool CanSendRnicContinuationProbe(
+    bool CanSendRnicAckProbe(
         Ptr<RdmaQueuePair> qp,
         const GateLookupResult& gate,
         Time now) const;
+
+    void RefreshRnicAckFlushEvents();
+    void CancelRnicAckFlushEvents();
+    void ScheduleRnicAckFlushEvent(
+        uint32_t rnicPort,
+        uint32_t slotIndex);
+    void RunRnicAckFlushEvent(
+        uint32_t rnicPort,
+        uint32_t slotIndex,
+        uint64_t windowStartNs,
+        uint64_t windowEndNs);
+    uint64_t GetRnicAckFlushGuardNs(
+        uint32_t rnicPort,
+        uint64_t windowLengthNs) const;
+    static uint64_t MakeRnicAckFlushEventKey(
+        uint32_t rnicPort,
+        uint32_t slotIndex);
 
     bool Allows(
         Ptr<RdmaQueuePair> qp,
@@ -261,12 +310,20 @@ private:
         uint64_t completedBytes;
         uint64_t outstandingBytes;
         uint64_t lastAggregateBlockWindowEndNs;
+        bool operationCompleteNotified;
+        bool operationFailureNotified;
+        uint64_t failedWrId;
+        uint32_t firstErrorStatus;
 
         UserspaceQpState()
             : postedBytes(0),
               completedBytes(0),
               outstandingBytes(0),
-              lastAggregateBlockWindowEndNs(0)
+              lastAggregateBlockWindowEndNs(0),
+              operationCompleteNotified(false),
+              operationFailureNotified(false),
+              failedWrId(0),
+              firstErrorStatus(RDMA_WR_CQE_SUCCESS)
         {
         }
     };
@@ -281,6 +338,9 @@ private:
     GateMode m_mode;
     bool m_enabled; // Mode-2 userspace transport active only in MODE_USERSPACE
     bool m_gateEnabled;
+    bool m_rnicAckFlushEnabled;
+    uint64_t m_rnicAckFlushGuardNs;
+    std::map<uint64_t, EventId> m_rnicAckFlushEvents;
     UserspaceAdmissionMode m_userspaceAdmissionMode;
 
     struct GateTable
@@ -321,7 +381,8 @@ private:
     bool m_realDeploymentMode;
     uint64_t m_bottleneckRateBps;
     uint64_t m_switchingGuardNs;
-    uint64_t m_maxObservedRttNs;
+    uint64_t m_userspaceInitialRttNs;
+    uint64_t m_userspaceMinTailGuardOverrideNs;
     uint32_t m_activeQpHint;
 
     struct PostStats
@@ -339,6 +400,11 @@ private:
         uint64_t minCompletionLatencyNs;
         uint64_t maxCompletionLatencyNs;
         uint64_t lastCompletedWrId;
+        uint64_t errorCompletionCount;
+        uint64_t retryExceededCount;
+        uint64_t wrFlushErrorCount;
+        uint64_t failedWrId;
+        uint32_t firstErrorStatus;
         uint32_t sampleCount;
 
         PostStats()
@@ -355,6 +421,11 @@ private:
               minCompletionLatencyNs(0),
               maxCompletionLatencyNs(0),
               lastCompletedWrId(0),
+              errorCompletionCount(0),
+              retryExceededCount(0),
+              wrFlushErrorCount(0),
+              failedWrId(0),
+              firstErrorStatus(RDMA_WR_CQE_SUCCESS),
               sampleCount(0)
         {
         }

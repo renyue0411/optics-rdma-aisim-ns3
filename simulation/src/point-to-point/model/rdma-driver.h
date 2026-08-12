@@ -10,6 +10,9 @@
 #include <unordered_map>
 #include <ns3/rdma-transport.h>
 
+// MODE2_VERBS_COMPLETION_V2: userspace operation completion is owned by final signaled-WR CQE.
+// MODE2_VERBS_ERROR_CQE_V1: expose a separate userspace-visible QP error trace.
+
 namespace ns3 {
 
 class RdmaDriver : public Object {
@@ -19,6 +22,7 @@ public:
 
 	// trace
 	TracedCallback<Ptr<RdmaQueuePair> > m_traceQpComplete;
+	TracedCallback<Ptr<RdmaQueuePair>, uint32_t> m_traceQpError;
     TracedCallback<Ptr<RdmaQueuePair> > m_traceSendComplete;
 
     static TypeId GetTypeId (void);
@@ -41,8 +45,15 @@ public:
 	void EnbaleNVLS();
 	void DisableNVLS();
 	
-	// callback when qp completes
+	// RNIC teardown callback. In Mode 2, userspace-visible completion is
+	// emitted earlier from the final signaled-WR CQE.
 	void QpComplete(Ptr<RdmaQueuePair> q);
+    void WrComplete(Ptr<RdmaQueuePair> q,
+                    uint64_t wrId,
+                    uint64_t bytes,
+                    uint64_t postTimeNs,
+                    uint64_t completionTimeNs,
+                    uint32_t cqeStatus);
     void SendComplete(Ptr<RdmaQueuePair> q);
 
 	enum InjectionMode{

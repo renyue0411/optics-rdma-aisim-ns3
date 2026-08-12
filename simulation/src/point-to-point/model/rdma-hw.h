@@ -14,6 +14,9 @@
 
 // MODE2_CQE_SEMANTICS_V1: RNIC keeps signaled-WR boundaries internally.
 // MODE1_CONTINUATION_ACK_RECOVERY_V1: bounded next-window DATA probing.
+// MODE1_FINAL_ACK_RECOVERY_V1: receiver-window flush plus final-tail probing.
+// MODE2_RNIC_RC_RETRY_V1: stock-RNIC ACK timeout/retry below the verbs boundary.
+// MODE2_VERBS_ERROR_CQE_V1: retry exhaustion becomes error CQEs plus QP error teardown.
 
 namespace ns3 {
 
@@ -96,6 +99,13 @@ public:
 	// size is the configured MTU and the attempt bound is an RNIC constant.
 	bool m_rnicAckRecoveryEnabled;
 
+	// Mode-2 model of the RC reliability engine in a commodity RNIC. This is
+	// deliberately independent of RdmaTransport/OCS scheduling: a real RNIC
+	// retries according to its QP timer even when userspace has stopped posting.
+	bool m_rcAckRetryEnabled;
+	uint64_t m_rcAckTimeoutNs;
+	uint32_t m_rcRetryCount;
+
 	uint32_t m_gpus_per_server; // uesed for routing; if src and dst in the same server, then communicate by nvswitch.
 	uint32_t nvls_enable;
 	std::set<uint32_t> nvswitch_set;
@@ -107,7 +117,7 @@ public:
     SendCompleteCallback m_sendCompleteCallback;
 	typedef Callback<void, Ptr<RdmaQueuePair> > QpProgressCallback;
 	typedef Callback<void, Ptr<RdmaQueuePair> > QpRecoverCallback;
-	typedef Callback<void, Ptr<RdmaQueuePair>, uint64_t, uint64_t, uint64_t, uint64_t>
+	typedef Callback<void, Ptr<RdmaQueuePair>, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t>
 		WrCompletionCallback;
 
 	struct PostedWrRecord
@@ -182,6 +192,7 @@ public:
 	void SetQpRecoverCallback(QpRecoverCallback cb);
 	void SetWrCompletionCallback(WrCompletionCallback cb);
 	void GenerateWrCompletions(Ptr<RdmaQueuePair> qp);
+	void GenerateWrErrorCompletions(Ptr<RdmaQueuePair> qp);
 	void SetRnicGateCallbacks(RnicGateAllowCallback allowCb,
 	                          RnicGateNextTimeCallback nextTimeCb);
 	void ClearRnicGateCallbacks();
@@ -198,12 +209,27 @@ public:
 	void UpdateRnicDeadlineRtt(Ptr<RdmaQueuePair> qp, uint64_t ackSeq);
 	void InvalidateRnicDeadlineSample(Ptr<RdmaQueuePair> qp);
 	void ConfigureRnicAckRecovery(bool enabled);
+	void ConfigureRcAckRetry(bool enabled,
+	                         uint64_t ackTimeoutNs,
+	                         uint32_t retryCount);
+	bool IsRcAckRetryEnabled() const;
+	void ArmRcAckTimeout(Ptr<RdmaQueuePair> qp, bool resetRetryBudget);
+	void CancelRcAckTimeout(Ptr<RdmaQueuePair> qp);
+	void HandleRcAckTimeout(Ptr<RdmaQueuePair> qp, uint64_t expectedUna);
+	void QpError(Ptr<RdmaQueuePair> qp, uint32_t status);
+	void PrintQpTerminalStats(Ptr<RdmaQueuePair> qp, const char* terminal);
 	bool IsRnicAckRecoveryEnabled() const;
 	uint32_t GetRnicAckRecoveryMaxAttempts() const;
 	void ResetRnicAckRecoveryState(Ptr<RdmaQueuePair> qp);
 	void HandleRnicAckRecoveryProgress(Ptr<RdmaQueuePair> qp,
 	                                   uint64_t oldUna,
-	                                   uint64_t ackSeq); // setup shared data and callbacks with the QbbNetDevice
+	                                   uint64_t ackSeq);
+	void FlushRnicPortAcks(uint32_t rnicPort,
+	                       const std::vector<uint64_t>& reachableBitmapWords,
+	                       uint64_t windowStartNs,
+	                       uint64_t windowEndNs);
+
+	// Setup shared data and callbacks with the QbbNetDevice.
 	static uint64_t GetQpKey(uint32_t dip, uint16_t sport, uint16_t pg); // get the lookup key for m_qpMap
 	Ptr<RdmaQueuePair> GetQp(uint32_t dip, uint16_t sport, uint16_t pg); // get the qp
 	uint32_t GetNicIdxOfQp(Ptr<RdmaQueuePair> qp); // get the NIC index of the qp
@@ -220,6 +246,9 @@ public:
 	uint32_t GetNicIdxOfRxQp(Ptr<RdmaRxQueuePair> q); // get the NIC index of the rxQp
 	void DeleteRxQp(uint32_t dip, uint16_t pg, uint16_t dport);
 
+	void SendRxControlPacket(Ptr<RdmaRxQueuePair> rxQp,
+	                         bool nack,
+	                         const char* reason);
 	int ReceiveUdp(Ptr<QbbNetDevice> ingressDev, Ptr<Packet> p, CustomHeader &ch);
 	int ReceiveCnp(Ptr<Packet> p, CustomHeader &ch);
 	int ReceiveAck(Ptr<Packet> p, CustomHeader &ch); // handle both ACK and NACK

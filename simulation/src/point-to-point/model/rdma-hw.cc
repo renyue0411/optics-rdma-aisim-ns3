@@ -21,6 +21,9 @@
 
 // MODE2_CQE_SEMANTICS_V1: complete WR boundaries generate CQE callbacks.
 // MODE1_CONTINUATION_ACK_RECOVERY_V1: bounded next-window DATA probing.
+// MODE1_FINAL_ACK_RECOVERY_V1: receiver-window flush plus final-tail probing.
+// MODE2_RNIC_RC_RETRY_V1: stock-RNIC ACK timeout/retry below the verbs boundary.
+// MODE2_VERBS_ERROR_CQE_V1: retry exhaustion becomes verbs-style error CQEs.
 
 namespace ns3{
 
@@ -278,6 +281,9 @@ RdmaHw::RdmaHw(){
 	m_rnicDeadlineMinRttSamples = 4;
 	m_rnicDeadlineRttVarMultiplier = 4;
 	m_rnicAckRecoveryEnabled = false;
+	m_rcAckRetryEnabled = false;
+	m_rcAckTimeoutNs = 100000;
+	m_rcRetryCount = 7;
 }
 
 void RdmaHw::enable_nvls() {
@@ -454,7 +460,8 @@ void RdmaHw::GenerateWrCompletions(Ptr<RdmaQueuePair> qp){
                 record.wrId,
                 record.bytes,
                 record.postTimeNs,
-                completionTimeNs);
+                completionTimeNs,
+                RDMA_WR_CQE_SUCCESS);
         }
     }
 
@@ -464,6 +471,48 @@ void RdmaHw::GenerateWrCompletions(Ptr<RdmaQueuePair> qp){
             m_nextWrId.erase(key);
         }
     }
+}
+
+void RdmaHw::GenerateWrErrorCompletions(Ptr<RdmaQueuePair> qp){
+    if (qp == NULL){
+        return;
+    }
+
+    const uint64_t key = GetQpKey(qp->dip.Get(), qp->sport, qp->m_pg);
+    std::map<uint64_t, std::deque<PostedWrRecord> >::iterator it =
+        m_postedWrRecords.find(key);
+    NS_ASSERT_MSG(
+        it != m_postedWrRecords.end() && !it->second.empty(),
+        "RC retry exhaustion requires at least one posted WR awaiting a CQE");
+
+    std::deque<PostedWrRecord>& records = it->second;
+    const uint64_t completionTimeNs =
+        static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
+    bool firstError = true;
+
+    // A real RC QP reports the WQE that hit the retry limit as retry-exceeded;
+    // later already-posted WQEs are flushed when the QP enters error.  Keep
+    // exactly that distinction at the simulated verbs/CQ boundary.
+    while (!records.empty()){
+        const PostedWrRecord record = records.front();
+        records.pop_front();
+        const uint32_t status = firstError
+            ? static_cast<uint32_t>(RDMA_WR_CQE_RETRY_EXC_ERR)
+            : static_cast<uint32_t>(RDMA_WR_CQE_WR_FLUSH_ERR);
+        firstError = false;
+        if (!m_wrCompletionCallback.IsNull()){
+            m_wrCompletionCallback(
+                qp,
+                record.wrId,
+                record.bytes,
+                record.postTimeNs,
+                completionTimeNs,
+                status);
+        }
+    }
+
+    m_postedWrRecords.erase(it);
+    m_nextWrId.erase(key);
 }
 
 void RdmaHw::SetRnicGateCallbacks(RnicGateAllowCallback allowCb,
@@ -515,13 +564,151 @@ void RdmaHw::ConfigureRnicAckRecovery(bool enabled){
 		          << " enabled=1"
 		          << " probe_bytes=" << m_mtu
 		          << " max_attempts=" << GetRnicAckRecoveryMaxAttempts()
-		          << " policy=next_window_continuation_data"
+		          << " policy=next_window_continuation_or_tail_data"
 		          << std::endl;
 	}
 }
 
 bool RdmaHw::IsRnicAckRecoveryEnabled() const{
 	return m_rnicAckRecoveryEnabled;
+}
+
+void RdmaHw::ConfigureRcAckRetry(bool enabled,
+                                 uint64_t ackTimeoutNs,
+                                 uint32_t retryCount){
+	m_rcAckRetryEnabled = enabled && ackTimeoutNs != 0;
+	m_rcAckTimeoutNs = ackTimeoutNs;
+	m_rcRetryCount = retryCount;
+
+	std::cout << "[RNIC RC RETRY CONFIG]"
+	          << " node="
+	          << (m_node != NULL ? static_cast<int64_t>(m_node->GetId()) : -1)
+	          << " enabled=" << (m_rcAckRetryEnabled ? 1 : 0)
+	          << " ack_timeout_ns=" << m_rcAckTimeoutNs
+	          << " retry_count=" << m_rcRetryCount
+	          << " schedule_awareness=none"
+	          << " owner=commodity_rnic"
+	          << std::endl;
+}
+
+bool RdmaHw::IsRcAckRetryEnabled() const{
+	return m_rcAckRetryEnabled;
+}
+
+void RdmaHw::CancelRcAckTimeout(Ptr<RdmaQueuePair> qp){
+	if (qp == NULL){
+		return;
+	}
+	if (!qp->m_rcAckTimeoutEvent.IsExpired()){
+		Simulator::Cancel(qp->m_rcAckTimeoutEvent);
+	}
+}
+
+void RdmaHw::ArmRcAckTimeout(Ptr<RdmaQueuePair> qp, bool resetRetryBudget){
+	if (!m_rcAckRetryEnabled || qp == NULL || qp->m_rcRetryExhausted){
+		return;
+	}
+
+	CancelRcAckTimeout(qp);
+	if (resetRetryBudget){
+		qp->m_rcRetryAttempts = 0;
+	}
+
+	// Only sent-but-unacknowledged sequence space is protected by the RNIC
+	// retry timer. Merely posted WR bytes do not start the timer.
+	if (qp->snd_una >= qp->m_highestSentSeq){
+		return;
+	}
+
+	const uint64_t expectedUna = qp->snd_una;
+	qp->m_rcAckTimeoutEvent = Simulator::Schedule(
+		NanoSeconds(m_rcAckTimeoutNs),
+		&RdmaHw::HandleRcAckTimeout,
+		this,
+		qp,
+		expectedUna);
+}
+
+void RdmaHw::HandleRcAckTimeout(Ptr<RdmaQueuePair> qp, uint64_t expectedUna){
+	// Drop the handle to the event currently executing so a retry packet can
+	// immediately arm the next hardware timeout from PktSent().
+	if (qp != NULL){
+		qp->m_rcAckTimeoutEvent = EventId();
+	}
+
+	if (!m_rcAckRetryEnabled || qp == NULL || qp->m_rcRetryExhausted){
+		return;
+	}
+
+	const uint64_t key = GetQpKey(qp->dip.Get(), qp->sport, qp->m_pg);
+	auto qpIt = m_qpMap.find(key);
+	if (qpIt == m_qpMap.end() || qpIt->second != qp){
+		return;
+	}
+
+	// ACK progress invalidates an older timer instance. ReceiveAck normally
+	// cancels/re-arms it eagerly; this guard makes the event race-safe.
+	if (qp->snd_una != expectedUna || qp->snd_una >= qp->m_highestSentSeq){
+		return;
+	}
+
+	qp->m_timeoutCount++;
+	const uint64_t retryStart = qp->snd_una;
+	const uint64_t retryEnd = qp->m_highestSentSeq;
+
+	if (qp->m_rcRetryAttempts >= m_rcRetryCount){
+		qp->m_rcRetryExhausted = true;
+		qp->m_rcRetryExhaustedCount++;
+		std::cout << "[RNIC RC RETRY EXHAUSTED]"
+		          << " t_ns=" << Simulator::Now().GetNanoSeconds()
+		          << " node=" << m_node->GetId()
+		          << " src=" << qp->m_src
+		          << " dst=" << qp->m_dest
+		          << " sport=" << qp->sport
+		          << " dport=" << qp->dport
+		          << " snd_una=" << qp->snd_una
+		          << " highest_sent=" << qp->m_highestSentSeq
+		          << " retries=" << qp->m_rcRetryAttempts
+		          << " retry_count=" << m_rcRetryCount
+		          << " action=qp_error_emit_error_cqes"
+		          << std::endl;
+		QpError(qp, RDMA_WR_CQE_RETRY_EXC_ERR);
+		return;
+	}
+
+	qp->m_rcRetryAttempts++;
+	qp->m_rcRetryAttemptCount++;
+	std::cout << "[RNIC RC ACK TIMEOUT]"
+	          << " t_ns=" << Simulator::Now().GetNanoSeconds()
+	          << " node=" << m_node->GetId()
+	          << " src=" << qp->m_src
+	          << " dst=" << qp->m_dest
+	          << " sport=" << qp->sport
+	          << " dport=" << qp->dport
+	          << " snd_una=" << qp->snd_una
+	          << " highest_sent=" << qp->m_highestSentSeq
+	          << " retry_start_seq=" << retryStart
+	          << " retry_end_seq=" << retryEnd
+	          << " attempt=" << qp->m_rcRetryAttempts
+	          << " retry_count=" << m_rcRetryCount
+	          << " schedule_awareness=none"
+	          << " action=go_back_n_retransmit"
+	          << std::endl;
+
+	// Reuse the RNIC's existing Go-Back-N retransmission machinery. Mode 2
+	// clears the Mode-1 gate callbacks, so TriggerTransmit() below does not wait
+	// for an OCS window; this is intentional stock-RNIC behaviour.
+	RecoverQueue(qp);
+	const uint32_t nicIdx = GetNicIdxOfQp(qp);
+	m_nic[nicIdx].dev->TriggerTransmit();
+
+	// If the device could not immediately serialize a retry (e.g. it is busy),
+	// keep the hardware timer alive. If PktSent() already armed it, this is a
+	// no-op.
+	if (qp->m_rcAckTimeoutEvent.IsExpired() &&
+		qp->snd_una < qp->m_highestSentSeq){
+		ArmRcAckTimeout(qp, false);
+	}
 }
 
 uint32_t RdmaHw::GetRnicAckRecoveryMaxAttempts() const{
@@ -535,6 +722,8 @@ void RdmaHw::ResetRnicAckRecoveryState(Ptr<RdmaQueuePair> qp){
 	qp->m_ackRecoveryActive = false;
 	qp->m_ackRecoveryPermit = false;
 	qp->m_ackRecoveryProbeInFlight = false;
+	qp->m_ackRecoveryPermitType = RNIC_ACK_PROBE_NONE;
+	qp->m_ackRecoveryInFlightType = RNIC_ACK_PROBE_NONE;
 	qp->m_ackRecoveryNextWindowStartNs = 0;
 	qp->m_ackRecoveryPermitWindowStartNs = 0;
 	qp->m_ackRecoveryProbeStartSeq = 0;
@@ -559,6 +748,56 @@ void RdmaHw::HandleRnicAckRecoveryProgress(Ptr<RdmaQueuePair> qp,
 	}
 
 	if (qp->m_ackRecoveryProbeInFlight){
+		if (qp->m_ackRecoveryInFlightType == RNIC_ACK_PROBE_TAIL){
+			if (qp->snd_una >= qp->m_highestSentSeq){
+				qp->m_ackRecoverySuccessCount++;
+				std::cout << "[RNIC ACK RECOVERY SUCCESS]"
+				          << " t_ns=" << nowNs
+				          << " node=" << m_node->GetId()
+				          << " src=" << qp->m_src
+				          << " dst=" << qp->m_dest
+				          << " sport=" << qp->sport
+				          << " probe_type=tail"
+				          << " ack_seq=" << ackSeq
+				          << " snd_una=" << qp->snd_una
+				          << " highest_sent=" << qp->m_highestSentSeq
+				          << " probe_start_seq=" << qp->m_ackRecoveryProbeStartSeq
+				          << " probe_end_seq=" << qp->m_ackRecoveryProbeEndSeq
+				          << " attempts=" << qp->m_ackRecoveryAttempts
+				          << std::endl;
+				ResetRnicAckRecoveryState(qp);
+				return;
+			}
+
+			if (qp->snd_una >= qp->m_ackRecoveryProbeEndSeq){
+				qp->m_ackRecoveryPartialAckCount++;
+				std::cout << "[RNIC ACK RECOVERY PARTIAL]"
+				          << " t_ns=" << nowNs
+				          << " node=" << m_node->GetId()
+				          << " src=" << qp->m_src
+				          << " dst=" << qp->m_dest
+				          << " sport=" << qp->sport
+				          << " ack_seq=" << ackSeq
+				          << " snd_una=" << qp->snd_una
+				          << " highest_sent=" << qp->m_highestSentSeq
+				          << " probe_start_seq=" << qp->m_ackRecoveryProbeStartSeq
+				          << " probe_end_seq=" << qp->m_ackRecoveryProbeEndSeq
+				          << " action=next_oldest_tail_probe"
+				          << std::endl;
+
+				// ACKs do not identify which DATA elicited them. A partial ACK
+				// may be an older cumulative ACK delayed behind the probe, so it
+				// is not sufficient evidence for an immediate Go-Back-N. Keep
+				// recovery active and probe the new snd_una in a later reachable
+				// window. An explicit NACK still enters the existing GBN path.
+				qp->m_ackRecoveryProbeInFlight = false;
+				qp->m_ackRecoveryInFlightType = RNIC_ACK_PROBE_NONE;
+				qp->m_ackRecoveryPermit = false;
+				qp->m_ackRecoveryPermitType = RNIC_ACK_PROBE_NONE;
+			}
+			return;
+		}
+
 		if (qp->snd_una >= qp->m_ackRecoveryProbeEndSeq){
 			qp->m_ackRecoverySuccessCount++;
 			std::cout << "[RNIC ACK RECOVERY SUCCESS]"
@@ -567,6 +806,7 @@ void RdmaHw::HandleRnicAckRecoveryProgress(Ptr<RdmaQueuePair> qp,
 			          << " src=" << qp->m_src
 			          << " dst=" << qp->m_dest
 			          << " sport=" << qp->sport
+			          << " probe_type=continuation"
 			          << " ack_seq=" << ackSeq
 			          << " snd_una=" << qp->snd_una
 			          << " probe_start_seq=" << qp->m_ackRecoveryProbeStartSeq
@@ -578,8 +818,19 @@ void RdmaHw::HandleRnicAckRecoveryProgress(Ptr<RdmaQueuePair> qp,
 		return;
 	}
 
-	// A delayed cumulative ACK arrived before the continuation packet was
-	// transmitted.  Normal transport credit is authoritative from here.
+	// A delayed cumulative ACK arrived before the scheduled recovery packet.
+	// Keep the already scheduled opportunity when progress is real but still
+	// insufficient; otherwise ordinary transport credit becomes authoritative.
+	const bool stillNeedsTail =
+		qp->GetBytesLeft() == 0 &&
+		qp->snd_una < qp->m_highestSentSeq;
+	const bool stillNeedsContinuation =
+		qp->GetBytesLeft() > 0 &&
+		qp->IsWinBound() &&
+		qp->snd_una < qp->snd_nxt &&
+		qp->snd_nxt >= qp->m_highestSentSeq;
+	const bool keepRecovery = stillNeedsTail || stillNeedsContinuation;
+
 	qp->m_ackRecoveryDelayedAckCount++;
 	std::cout << "[RNIC ACK RECOVERY DELAYED ACK]"
 	          << " t_ns=" << nowNs
@@ -590,8 +841,12 @@ void RdmaHw::HandleRnicAckRecoveryProgress(Ptr<RdmaQueuePair> qp,
 	          << " old_una=" << oldUna
 	          << " new_una=" << qp->snd_una
 	          << " ack_seq=" << ackSeq
+	          << " action="
+	          << (keepRecovery ? "keep_scheduled_probe" : "release_recovery")
 	          << std::endl;
-	ResetRnicAckRecoveryState(qp);
+	if (!keepRecovery){
+		ResetRnicAckRecoveryState(qp);
+	}
 }
 
 uint64_t RdmaHw::GetRnicDeadlineReserveNs(Ptr<RdmaQueuePair> qp) const{
@@ -950,9 +1205,12 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 
 
 void RdmaHw::DeleteQueuePair(Ptr<RdmaQueuePair> qp){
+	CancelRcAckTimeout(qp);
 	// remove qp from the m_qpMap
 	uint64_t key = GetQpKey(qp->dip.Get(), qp->sport, qp->m_pg);
 	m_qpMap.erase(key);
+	m_postedWrRecords.erase(key);
+	m_nextWrId.erase(key);
 	qp_cnp.erase(key);
 	last_qp_cnp.erase(key);
 	last_qp_rate.erase(key);
@@ -1047,24 +1305,170 @@ void RdmaHw::SendComplete(Ptr<RdmaQueuePair> qp)
 	m_sendCompleteCallback(qp);
 }
 
+void RdmaHw::SendRxControlPacket(Ptr<RdmaRxQueuePair> rxQp,
+	                                bool nack,
+	                                const char* reason){
+	if (rxQp == NULL || !rxQp->m_hasAckMetadata){
+		return;
+	}
+
+	qbbHeader seqh;
+	seqh.SetSeq(rxQp->ReceiverNextExpectedSeq);
+	seqh.SetPG(rxQp->m_ecn_source.qIndex);
+	seqh.SetSport(rxQp->sport);
+	seqh.SetDport(rxQp->dport);
+	seqh.SetIntHeader(rxQp->m_lastAckIntHeader);
+	if (rxQp->m_ackCnpPending){
+		seqh.SetCnp();
+	}
+
+	Ptr<Packet> newp = Create<Packet>(
+		std::max(60 - 14 - 20 - (int)seqh.GetSerializedSize(), 0));
+	newp->AddHeader(seqh);
+
+	Ipv4Header head;
+	head.SetDestination(Ipv4Address(rxQp->dip));
+	head.SetSource(Ipv4Address(rxQp->sip));
+	head.SetProtocol(nack ? 0xFD : 0xFC);
+	head.SetTtl(64);
+	head.SetPayloadSize(newp->GetSize());
+	head.SetIdentification(rxQp->m_ipid++);
+	if (rxQp->m_lastAckTos == 4){
+		head.SetTos(4);
+	}
+
+	newp->AddHeader(head);
+	AddHeader(newp, 0x800);
+
+	const uint32_t nicIdx = GetNicIdxOfRxQp(rxQp);
+	m_nic[nicIdx].dev->RdmaEnqueueHighPrioQ(newp);
+
+	const uint32_t localNode = (rxQp->sip >> 8) & 0xffff;
+	if (localNode == m_node->GetId() &&
+		m_node->GetNodeType() == 2 &&
+		rxQp->m_lastAckTos == 4){
+		m_nic[nicIdx].dev->SwitchAsHostSend();
+	}else{
+		m_nic[nicIdx].dev->TriggerTransmit();
+	}
+
+	if (!nack){
+		rxQp->m_lastAckGeneratedSeq = rxQp->ReceiverNextExpectedSeq;
+		rxQp->m_ackDirty = false;
+		rxQp->m_ackGeneratedCount++;
+	}
+	rxQp->m_ackCnpPending = false;
+
+	if (reason != NULL && (reason[0] == 'w' || reason[0] == 'd')){
+		std::cout << "[RNIC RX CONTROL]"
+		          << " t_ns=" << Simulator::Now().GetNanoSeconds()
+		          << " node=" << m_node->GetId()
+		          << " rnic_port="
+		          << (rxQp->m_hasBoundRnicPort
+		                  ? static_cast<int64_t>(rxQp->m_boundRnicPort)
+		                  : -1)
+		          << " remote=" << ((rxQp->dip >> 8) & 0xffff)
+		          << " type=" << (nack ? "NACK" : "ACK")
+		          << " ack_seq=" << rxQp->ReceiverNextExpectedSeq
+		          << " reason=" << reason
+		          << std::endl;
+	}
+}
+
+void RdmaHw::FlushRnicPortAcks(
+	uint32_t rnicPort,
+	const std::vector<uint64_t>& reachableBitmapWords,
+	uint64_t windowStartNs,
+	uint64_t windowEndNs){
+	std::vector<uint64_t> flushKeys;
+
+	for (std::unordered_map<uint64_t, Ptr<RdmaRxQueuePair> >::const_iterator it =
+		     m_rxQpMap.begin();
+		 it != m_rxQpMap.end();
+		 ++it){
+		Ptr<RdmaRxQueuePair> rxQp = it->second;
+		if (rxQp == NULL ||
+			!rxQp->m_hasBoundRnicPort ||
+			rxQp->m_boundRnicPort != rnicPort ||
+			!rxQp->m_ackDirty ||
+			!rxQp->m_hasAckMetadata){
+			continue;
+		}
+
+		const uint32_t remoteNode = (rxQp->dip >> 8) & 0xffff;
+		const uint32_t wordIndex = remoteNode / 64;
+		const uint32_t bitIndex = remoteNode % 64;
+		if (wordIndex >= reachableBitmapWords.size() ||
+			(reachableBitmapWords[wordIndex] & (1ULL << bitIndex)) == 0){
+			continue;
+		}
+
+		flushKeys.push_back(it->first);
+	}
+
+	// ACK ordering affects which control packets fit before a short optical
+	// window closes. Sort the QP keys so experiments remain reproducible even
+	// though the receive-QP table itself is an unordered_map.
+	std::sort(flushKeys.begin(), flushKeys.end());
+	uint32_t flushedQps = 0;
+	for (uint32_t i = 0; i < flushKeys.size(); ++i){
+		std::unordered_map<uint64_t, Ptr<RdmaRxQueuePair> >::iterator found =
+			m_rxQpMap.find(flushKeys[i]);
+		if (found == m_rxQpMap.end() || found->second == NULL ||
+			!found->second->m_ackDirty){
+			continue;
+		}
+		SendRxControlPacket(found->second, false, "window_flush");
+		found->second->m_ackFlushCount++;
+		flushedQps++;
+	}
+
+	if (flushedQps != 0){
+		const uint64_t nowNs =
+			static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
+		const uint64_t actualLeadNs =
+			windowEndNs > nowNs ? windowEndNs - nowNs : 0;
+		std::cout << "[RNIC PORT ACK FLUSH]"
+		          << " t_ns=" << nowNs
+		          << " node=" << m_node->GetId()
+		          << " rnic_port=" << rnicPort
+		          << " window_start_ns=" << windowStartNs
+		          << " window_end_ns=" << windowEndNs
+		          << " actual_lead_ns=" << actualLeadNs
+		          << " flushed_qps=" << flushedQps
+		          << std::endl;
+	}
+}
+
 int RdmaHw::ReceiveUdp(Ptr<QbbNetDevice> ingressDev, Ptr<Packet> p, CustomHeader &ch){
 	uint8_t ecnbits = ch.GetIpv4EcnBits();
-	
+
 	uint32_t payload_size = p->GetSize() - ch.GetSerializedSize();
-	// TODO find corresponding rx queue pair
-	Ptr<RdmaRxQueuePair> rxQp = GetRxQp(ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg, true);
+	Ptr<RdmaRxQueuePair> rxQp = GetRxQp(
+		ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg, true);
 	BindRxQpToIngress(rxQp, GetNicIdxForDevice(ingressDev));
+
+	const uint64_t oldExpected = rxQp->ReceiverNextExpectedSeq;
+	// Preserve telemetry from the packet that can elicit the next control
+	// response. In particular, a tail duplicate may arrive in a later optical
+	// window and should not reuse an old INT snapshot.
+	rxQp->m_lastAckIntHeader = ch.udp.ih;
+	rxQp->m_lastAckTos = ch.m_tos;
+	rxQp->m_hasAckMetadata = true;
 	if (ecnbits != 0){
 		rxQp->m_ecn_source.ecnbits |= ecnbits;
 		rxQp->m_ecn_source.qfb++;
+		rxQp->m_ackCnpPending = true;
 	}
 	rxQp->m_ecn_source.total++;
-	rxQp->m_milestone_rx = m_ack_interval;
 
-	const bool acceptedNewData = (ch.udp.seq == rxQp->ReceiverNextExpectedSeq);
 	int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
-	if (acceptedNewData)
-	{
+	const uint64_t acceptedBytes =
+		rxQp->ReceiverNextExpectedSeq > oldExpected
+			? rxQp->ReceiverNextExpectedSeq - oldExpected
+			: 0;
+	if (acceptedBytes != 0){
+		rxQp->m_ackDirty = true;
 		const uint32_t srcNode = (ch.sip >> 8) & 0xffff;
 		const uint32_t dstNode = (ch.dip >> 8) & 0xffff;
 		RecordFlowRxBytes(srcNode,
@@ -1072,43 +1476,16 @@ int RdmaHw::ReceiveUdp(Ptr<QbbNetDevice> ingressDev, Ptr<Packet> p, CustomHeader
 		                  ch.udp.sport,
 		                  ch.udp.dport,
 		                  ch.udp.pg,
-		                  payload_size);
+		                  static_cast<uint32_t>(acceptedBytes));
 	}
-	if (x == 1 || x == 2){ //generate ACK or NACK
-		qbbHeader seqh;
-		seqh.SetSeq(rxQp->ReceiverNextExpectedSeq);
-		seqh.SetPG(ch.udp.pg);
-		seqh.SetSport(ch.udp.dport);
-		seqh.SetDport(ch.udp.sport);
-		seqh.SetIntHeader(ch.udp.ih);
-		if (ecnbits)
-			seqh.SetCnp();
 
-		Ptr<Packet> newp = Create<Packet>(std::max(60-14-20-(int)seqh.GetSerializedSize(), 0));
-		newp->AddHeader(seqh);
-
-		Ipv4Header head;	// Prepare IPv4 header
-		head.SetDestination(Ipv4Address(ch.sip));
-		head.SetSource(Ipv4Address(ch.dip));
-		head.SetProtocol(x == 1 ? 0xFC : 0xFD); //ack=0xFC nack=0xFD
-		head.SetTtl(64);
-		head.SetPayloadSize(newp->GetSize());
-		head.SetIdentification(rxQp->m_ipid++);
-		// GPU receives the packet and generate ACK with NVLS tag
-		if(ch.m_tos == 4) head.SetTos(4);
-
-		newp->AddHeader(head);
-		AddHeader(newp, 0x800);	// Attach PPP header
-		uint32_t sip = ch.sip;
-		uint32_t sid = (sip >> 8) & 0xffff;
-		uint32_t dip = ch.dip;
-		uint32_t did = (dip >> 8) & 0xffff;
-		// send
-		uint32_t nic_idx = GetNicIdxOfRxQp(rxQp);
-		m_nic[nic_idx].dev->RdmaEnqueueHighPrioQ(newp);
-		// 发送给目标 NVSwitch 的报文
-		if(did == m_node->GetId() && m_node->GetNodeType() == 2 && ch.m_tos == 4) m_nic[nic_idx].dev->SwitchAsHostSend();
-		else m_nic[nic_idx].dev->TriggerTransmit();
+	if (x == 1){
+		SendRxControlPacket(rxQp, false, "interval");
+	}else if (x == 2){
+		SendRxControlPacket(rxQp, true, "gap");
+	}else if (x == 3){
+		rxQp->m_duplicateAckCount++;
+		SendRxControlPacket(rxQp, false, "duplicate");
 	}
 	return 0;
 }
@@ -1171,6 +1548,7 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 
 	uint32_t nic_idx = GetNicIdxOfQp(qp);
 	Ptr<QbbNetDevice> dev = m_nic[nic_idx].dev;
+	bool rcAckProgress = false;
 	if (m_ack_interval == 0)
 		std::cout << "ERROR: shouldn't receive ack\n";
 	else {
@@ -1181,8 +1559,17 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 			UpdateRnicDeadlineRtt(qp, effectiveAckSeq);
 		}
 		qp->Acknowledge(effectiveAckSeq);
+		rcAckProgress = qp->snd_una > oldUna;
 		if (ch.l3Prot == 0xFC){
 			HandleRnicAckRecoveryProgress(qp, oldUna, effectiveAckSeq);
+			if (m_rcAckRetryEnabled && qp->snd_una > oldUna){
+				if (qp->snd_una < qp->m_highestSentSeq){
+					ArmRcAckTimeout(qp, true);
+				}else{
+					CancelRcAckTimeout(qp);
+					qp->m_rcRetryAttempts = 0;
+				}
+			}
 			GenerateWrCompletions(qp);
 		}
 		if (qp->IsFinished()){
@@ -1193,6 +1580,18 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 	{
 		qp->m_nackCount++;
 		RecoverQueue(qp);
+		if (m_rcAckRetryEnabled){
+			// A transport NACK is a retransmission hint, not fresh retry
+			// budget. Periodic gap NACKs must not keep an RC QP alive
+			// forever while snd_una is stalled. Only cumulative forward
+			// progress is allowed to reset the ACK-timeout retry budget.
+			if (qp->snd_una < qp->m_highestSentSeq){
+				ArmRcAckTimeout(qp, rcAckProgress);
+			}else{
+				CancelRcAckTimeout(qp);
+				qp->m_rcRetryAttempts = 0;
+			}
+		}
 	}
 
 	// handle cnp
@@ -1238,32 +1637,51 @@ int RdmaHw::Receive(Ptr<QbbNetDevice> ingressDev, Ptr<Packet> p, CustomHeader &c
 }
 
 int RdmaHw::ReceiverCheckSeq(uint64_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size){
-	uint64_t expected = q->ReceiverNextExpectedSeq;
-	if (seq == expected){
-		q->ReceiverNextExpectedSeq = expected + size;
-		if (q->ReceiverNextExpectedSeq >= q->m_milestone_rx){
-			q->m_milestone_rx += m_ack_interval;
-			return 1; //Generate ACK
-		}else if (q->ReceiverNextExpectedSeq % m_chunk == 0){
-			return 1;
-		}else {
-			return 5;
+	const uint64_t expected = q->ReceiverNextExpectedSeq;
+	const uint64_t packetEnd =
+		seq > std::numeric_limits<uint64_t>::max() - size
+			? std::numeric_limits<uint64_t>::max()
+			: seq + size;
+
+	if (seq <= expected && packetEnd > expected){
+		q->ReceiverNextExpectedSeq = packetEnd;
+
+		// A retransmission can start below expected when ACK processing rounds
+		// snd_una back to a chunk boundary. Accept its unseen suffix and ACK it
+		// immediately instead of treating the entire overlapping segment as old.
+		if (seq < expected){
+			return 3;
 		}
-	} else if (seq > expected) {
-		// Generate NACK
+
+		const bool intervalDue =
+			m_ack_interval != 0 &&
+			q->ReceiverNextExpectedSeq >= q->m_lastAckGeneratedSeq &&
+			q->ReceiverNextExpectedSeq - q->m_lastAckGeneratedSeq >=
+				m_ack_interval;
+		const bool chunkDue =
+			m_chunk != 0 && q->ReceiverNextExpectedSeq % m_chunk == 0;
+		return intervalDue || chunkDue ? 1 : 5;
+	}
+
+	if (seq > expected){
 		if (Simulator::Now() >= q->m_nackTimer || q->m_lastNACK != expected){
 			q->m_nackTimer = Simulator::Now() + MicroSeconds(m_nack_interval);
 			q->m_lastNACK = expected;
-			if (m_backto0){
-				q->ReceiverNextExpectedSeq = q->ReceiverNextExpectedSeq / m_chunk*m_chunk;
+			if (m_backto0 && m_chunk != 0){
+				q->ReceiverNextExpectedSeq =
+					q->ReceiverNextExpectedSeq / m_chunk * m_chunk;
+				q->m_lastAckGeneratedSeq = std::min<uint64_t>(
+					q->m_lastAckGeneratedSeq,
+					q->ReceiverNextExpectedSeq);
 			}
 			return 2;
-		}else
-			return 4;
-	}else {
-		// Duplicate. 
-		return 3;
+		}
+		return 4;
 	}
+
+	// Fully duplicate DATA is an ACK-eliciting tail probe. Return the current
+	// cumulative receive point without changing application-visible bytes.
+	return 3;
 }
 void RdmaHw::AddHeader (Ptr<Packet> p, uint16_t protocolNumber){
 	PppHeader ppp;
@@ -1299,8 +1717,10 @@ void RdmaHw::RecoverQueue(Ptr<RdmaQueuePair> qp){
 	qp->snd_nxt = qp->snd_una;
 }
 
-void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
-	NS_ASSERT(!m_qpCompleteCallback.IsNull());
+void RdmaHw::PrintQpTerminalStats(Ptr<RdmaQueuePair> qp, const char* terminal){
+	if (qp == NULL){
+		return;
+	}
 	std::cout << "[RNIC RETRANSMISSION STATS]"
 	          << " node=" << m_node->GetId()
 	          << " src=" << qp->m_src
@@ -1314,6 +1734,9 @@ void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
 	          << " retrans_bytes=" << qp->m_retransBytes
 	          << " nack_count=" << qp->m_nackCount
 	          << " timeout_count=" << qp->m_timeoutCount
+	          << " rc_retry_attempts_total=" << qp->m_rcRetryAttemptCount
+	          << " rc_retry_budget_used=" << qp->m_rcRetryAttempts
+	          << " rc_retry_exhausted=" << qp->m_rcRetryExhaustedCount
 	          << " deadline_samples=" << qp->m_deadlineValidSamples
 	          << " deadline_rejected_cross_window_samples="
 	          << qp->m_deadlineRejectedCrossWindowSamples
@@ -1328,6 +1751,10 @@ void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
 	          << qp->m_deadlineLastBlockedWindowEndNs
 	          << " ack_recovery_arms=" << qp->m_ackRecoveryArmCount
 	          << " ack_recovery_probes=" << qp->m_ackRecoveryProbeCount
+	          << " ack_recovery_tail_probes="
+	          << qp->m_ackRecoveryTailProbeCount
+	          << " ack_recovery_partial_ack="
+	          << qp->m_ackRecoveryPartialAckCount
 	          << " ack_recovery_success=" << qp->m_ackRecoverySuccessCount
 	          << " ack_recovery_delayed_ack=" << qp->m_ackRecoveryDelayedAckCount
 	          << " ack_recovery_nack=" << qp->m_ackRecoveryNackCount
@@ -1339,6 +1766,53 @@ void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
 	          << " ack_recovery_probe_in_flight="
 	          << (qp->m_ackRecoveryProbeInFlight ? 1 : 0)
 	          << std::endl;
+	std::cout << "[RNIC QP TERMINAL]"
+	          << " t_ns=" << Simulator::Now().GetNanoSeconds()
+	          << " node=" << m_node->GetId()
+	          << " src=" << qp->m_src
+	          << " dst=" << qp->m_dest
+	          << " sport=" << qp->sport
+	          << " dport=" << qp->dport
+	          << " terminal=" << terminal
+	          << " qp_error=" << (qp->m_qpError ? 1 : 0)
+	          << " qp_error_status=" << qp->m_qpErrorStatus
+	          << std::endl;
+}
+
+void RdmaHw::QpError(Ptr<RdmaQueuePair> qp, uint32_t status){
+	NS_ASSERT(!m_qpCompleteCallback.IsNull());
+	if (qp == NULL || qp->m_qpError){
+		return;
+	}
+
+	CancelRcAckTimeout(qp);
+	qp->m_qpError = true;
+	qp->m_qpErrorStatus = status;
+	ResetRnicAckRecoveryState(qp);
+	PrintQpTerminalStats(qp, "error");
+
+	if (m_cc_mode == 1){
+		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
+		Simulator::Cancel(qp->mlx.m_eventDecreaseRate);
+		Simulator::Cancel(qp->mlx.m_rpTimer);
+	}
+
+	// Error CQEs are emitted before teardown, just as a userspace poller would
+	// observe the failed/flush completions before resources are destroyed.
+	GenerateWrErrorCompletions(qp);
+	m_qpCompleteCallback(qp);
+
+	const uint32_t nicIdx = GetNicIdxOfQp(qp);
+	DeleteQueuePair(qp);
+	if (nicIdx < m_nic.size() && m_nic[nicIdx].dev != NULL){
+		m_nic[nicIdx].dev->TriggerTransmit();
+	}
+}
+
+void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
+	NS_ASSERT(!m_qpCompleteCallback.IsNull());
+	CancelRcAckTimeout(qp);
+	PrintQpTerminalStats(qp, "success");
 	if (m_cc_mode == 1){
 		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
 		Simulator::Cancel(qp->mlx.m_eventDecreaseRate);
@@ -1392,57 +1866,81 @@ void RdmaHw::RedistributeQp(){
 }
 
 Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
-	uint64_t payload_size = qp->GetBytesLeft();
-	if ((uint64_t)m_mtu < payload_size)
-		payload_size = m_mtu;
-	Ptr<Packet> p = Create<Packet> ((uint32_t)payload_size);
-	// add SimpleSeqTsHeader
-	SimpleSeqTsHeader seqTs;
-	seqTs.SetSeq (qp->snd_nxt);
-	seqTs.SetPG (qp->m_pg);
-	p->AddHeader (seqTs);
-	// add udp header
-	UdpHeader udpHeader;
-	udpHeader.SetDestinationPort (qp->dport);
-	udpHeader.SetSourcePort (qp->sport);
-	p->AddHeader (udpHeader);
-	// add ipv4 header
-	Ipv4Header ipHeader;
-	ipHeader.SetSource (qp->sip);
-	ipHeader.SetDestination (qp->dip);
-	ipHeader.SetProtocol (0x11);
-	ipHeader.SetPayloadSize (p->GetSize());
-	ipHeader.SetTtl (64);
-	// nvls <-> ToS, ToS = 1 -> NVLS enable
-	if(qp->nvls_enable == 1) ipHeader.SetTos (4);
-	else ipHeader.SetTos (0);
-	ipHeader.SetIdentification (qp->m_ipid);
-	p->AddHeader(ipHeader);
-	// add ppp header
-	PppHeader ppp;
-	ppp.SetProtocol (0x0021); // EtherToPpp(0x800), see point-to-point-net-device.cc
-	p->AddHeader (ppp);
+	NS_ASSERT_MSG(qp != NULL && !qp->m_qpError,
+	              "RNIC must not generate DATA for a QP in error");
+	const RnicAckRecoveryProbeType permitType =
+		qp->m_ackRecoveryPermit
+			? qp->m_ackRecoveryPermitType
+			: RNIC_ACK_PROBE_NONE;
+	const bool tailProbe = permitType == RNIC_ACK_PROBE_TAIL;
 
-	// Record whether this generated packet is a first transmission. PktSent()
-	// uses this metadata at the actual RNIC transmission point.
-	const uint64_t packetSeq = qp->snd_nxt;
+	uint64_t packetSeq;
+	uint64_t payload_size;
+	if (tailProbe){
+		NS_ASSERT_MSG(qp->snd_una < qp->m_highestSentSeq,
+		              "Tail recovery requires unacknowledged sent data");
+		packetSeq = qp->snd_una;
+		payload_size = std::min<uint64_t>(
+			m_mtu, qp->m_highestSentSeq - packetSeq);
+	}else{
+		packetSeq = qp->snd_nxt;
+		payload_size = std::min<uint64_t>(m_mtu, qp->GetBytesLeft());
+	}
+	NS_ASSERT_MSG(payload_size > 0, "RDMA DATA packet must carry payload");
+
+	Ptr<Packet> p = Create<Packet>((uint32_t)payload_size);
+	SimpleSeqTsHeader seqTs;
+	seqTs.SetSeq(packetSeq);
+	seqTs.SetPG(qp->m_pg);
+	p->AddHeader(seqTs);
+
+	UdpHeader udpHeader;
+	udpHeader.SetDestinationPort(qp->dport);
+	udpHeader.SetSourcePort(qp->sport);
+	p->AddHeader(udpHeader);
+
+	Ipv4Header ipHeader;
+	ipHeader.SetSource(qp->sip);
+	ipHeader.SetDestination(qp->dip);
+	ipHeader.SetProtocol(0x11);
+	ipHeader.SetPayloadSize(p->GetSize());
+	ipHeader.SetTtl(64);
+	if (qp->nvls_enable == 1) ipHeader.SetTos(4);
+	else ipHeader.SetTos(0);
+	ipHeader.SetIdentification(qp->m_ipid);
+	p->AddHeader(ipHeader);
+
+	PppHeader ppp;
+	ppp.SetProtocol(0x0021);
+	p->AddHeader(ppp);
+
 	qp->m_deadlineLastPacketSeq = packetSeq;
 	qp->m_deadlineLastPacketEndSeq = packetSeq + payload_size;
 	qp->m_deadlineLastPacketWasRetransmission =
 		(packetSeq < qp->m_highestSentSeq);
 
-	const bool continuationProbe = qp->m_ackRecoveryPermit;
-	if (continuationProbe){
-		NS_ASSERT_MSG(!qp->m_deadlineLastPacketWasRetransmission,
-		              "Continuation recovery must send new sequence space");
+	if (permitType != RNIC_ACK_PROBE_NONE){
+		if (permitType == RNIC_ACK_PROBE_CONTINUATION){
+			NS_ASSERT_MSG(!qp->m_deadlineLastPacketWasRetransmission,
+			              "Continuation recovery must send new sequence space");
+		}else{
+			NS_ASSERT_MSG(qp->m_deadlineLastPacketWasRetransmission,
+			              "Tail recovery must retransmit existing sequence space");
+		}
+
 		qp->m_ackRecoveryPermit = false;
+		qp->m_ackRecoveryPermitType = RNIC_ACK_PROBE_NONE;
 		qp->m_ackRecoveryProbeInFlight = true;
+		qp->m_ackRecoveryInFlightType = permitType;
 		qp->m_ackRecoveryLastProbeWindowStartNs =
 			qp->m_ackRecoveryPermitWindowStartNs;
 		qp->m_ackRecoveryProbeStartSeq = packetSeq;
 		qp->m_ackRecoveryProbeEndSeq = packetSeq + payload_size;
 		qp->m_ackRecoveryAttempts++;
 		qp->m_ackRecoveryProbeCount++;
+		if (tailProbe){
+			qp->m_ackRecoveryTailProbeCount++;
+		}
 
 		std::cout << "[RNIC ACK RECOVERY PROBE TX]"
 		          << " t_ns=" << Simulator::Now().GetNanoSeconds()
@@ -1450,6 +1948,8 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 		          << " src=" << qp->m_src
 		          << " dst=" << qp->m_dest
 		          << " sport=" << qp->sport
+		          << " probe_type="
+		          << (tailProbe ? "tail" : "continuation")
 		          << " plane="
 		          << (qp->m_hasBoundRnicPort
 		                  ? static_cast<int64_t>(qp->m_boundPlaneId)
@@ -1469,22 +1969,18 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 		          << std::endl;
 	}
 
-	// update retransmission accounting before advancing snd_nxt.
-	if (packetSeq < qp->m_highestSentSeq)
-	{
+	if (packetSeq < qp->m_highestSentSeq){
 		qp->m_retransPackets++;
-		qp->m_retransBytes += std::min<uint64_t>(payload_size,
-		                                              qp->m_highestSentSeq - packetSeq);
+		qp->m_retransBytes += std::min<uint64_t>(
+			payload_size, qp->m_highestSentSeq - packetSeq);
 	}
-	qp->m_highestSentSeq = std::max<uint64_t>(qp->m_highestSentSeq,
-	                                          packetSeq + payload_size);
 
-	// update state
-	qp->snd_nxt += payload_size;
-	// std::cout << "current snd_nxt is: " << qp->snd_nxt << ", the window is: " << qp->m_win << std::endl;
+	if (!tailProbe){
+		qp->m_highestSentSeq = std::max<uint64_t>(
+			qp->m_highestSentSeq, packetSeq + payload_size);
+		qp->snd_nxt += payload_size;
+	}
 	qp->m_ipid++;
-
-	// return
 	return p;
 }
 
@@ -1502,6 +1998,13 @@ void RdmaHw::PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap)
 			qp->m_deadlineLastAllowedWindowStartNs;
 		qp->m_deadlineSampleWindowEndNs =
 			qp->m_deadlineLastAllowedWindowEndNs;
+	}
+
+	if (m_rcAckRetryEnabled &&
+		!qp->m_rcRetryExhausted &&
+		qp->snd_una < qp->m_highestSentSeq &&
+		qp->m_rcAckTimeoutEvent.IsExpired()){
+		ArmRcAckTimeout(qp, false);
 	}
 
 	UpdateNextAvail(qp, interframeGap, pkt->GetSize());

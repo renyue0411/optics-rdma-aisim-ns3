@@ -11,8 +11,23 @@
 #include <vector>
 
 // MODE1_CONTINUATION_ACK_RECOVERY_V1: bounded next-window DATA probing.
+// MODE1_FINAL_ACK_RECOVERY_V1: receiver-window flush plus final-tail probing.
+// MODE2_RNIC_RC_RETRY_V1: commodity-RNIC-style ACK timeout/retry state.
+// MODE2_VERBS_ERROR_CQE_V1: expose RNIC failures only as CQE status to userspace.
 
 namespace ns3 {
+
+enum RdmaWrCqeStatus {
+	RDMA_WR_CQE_SUCCESS = 0,
+	RDMA_WR_CQE_RETRY_EXC_ERR = 1,
+	RDMA_WR_CQE_WR_FLUSH_ERR = 2
+};
+
+enum RnicAckRecoveryProbeType {
+	RNIC_ACK_PROBE_NONE = 0,
+	RNIC_ACK_PROBE_CONTINUATION = 1,
+	RNIC_ACK_PROBE_TAIL = 2
+};
 
 class RdmaQueuePair : public Object {
 public:
@@ -28,6 +43,17 @@ public:
 	uint64_t m_retransBytes;
 	uint64_t m_nackCount;
 	uint64_t m_timeoutCount;
+
+	// Mode-2 commodity-RNIC RC reliability state. Userspace never reads these
+	// fields; it observes only the resulting WR CQEs. The timer is intentionally
+	// schedule-unaware, matching a stock RNIC that does not know the OCS table.
+	EventId m_rcAckTimeoutEvent;
+	uint32_t m_rcRetryAttempts;
+	uint64_t m_rcRetryAttemptCount;
+	uint64_t m_rcRetryExhaustedCount;
+	bool m_rcRetryExhausted;
+	bool m_qpError;
+	uint32_t m_qpErrorStatus;
 
 	// Mode-1 ACK RTT estimator. One first-transmission sample is tracked per QP.
 	bool m_deadlineSampleOutstanding;
@@ -55,6 +81,8 @@ public:
 	bool m_ackRecoveryActive;
 	bool m_ackRecoveryPermit;
 	bool m_ackRecoveryProbeInFlight;
+	RnicAckRecoveryProbeType m_ackRecoveryPermitType;
+	RnicAckRecoveryProbeType m_ackRecoveryInFlightType;
 	uint64_t m_ackRecoveryNextWindowStartNs;
 	uint64_t m_ackRecoveryLastArmWindowEndNs;
 	uint64_t m_ackRecoveryPermitWindowStartNs;
@@ -66,6 +94,8 @@ public:
 	uint32_t m_ackRecoveryAttempts;
 	uint64_t m_ackRecoveryArmCount;
 	uint64_t m_ackRecoveryProbeCount;
+	uint64_t m_ackRecoveryTailProbeCount;
+	uint64_t m_ackRecoveryPartialAckCount;
 	uint64_t m_ackRecoverySuccessCount;
 	uint64_t m_ackRecoveryDelayedAckCount;
 	uint64_t m_ackRecoveryNackCount;
@@ -187,7 +217,15 @@ public:
 	uint16_t m_ipid;
 	uint64_t ReceiverNextExpectedSeq;
 	Time m_nackTimer;
-	int32_t m_milestone_rx;
+	uint64_t m_lastAckGeneratedSeq;
+	bool m_ackDirty;
+	IntHeader m_lastAckIntHeader;
+	uint8_t m_lastAckTos;
+	bool m_ackCnpPending;
+	bool m_hasAckMetadata;
+	uint64_t m_ackGeneratedCount;
+	uint64_t m_ackFlushCount;
+	uint64_t m_duplicateAckCount;
 	uint32_t m_lastNACK;
 	bool m_hasBoundRnicPort; // same-plane ACK/NACK affinity is active
 	uint32_t m_boundRnicPort;

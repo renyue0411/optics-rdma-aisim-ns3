@@ -8,6 +8,8 @@
 #include "rdma-queue-pair.h"
 
 // MODE1_CONTINUATION_ACK_RECOVERY_V1: bounded next-window DATA probing.
+// MODE2_RNIC_RC_RETRY_V1: commodity-RNIC-style ACK timeout/retry state.
+// MODE2_VERBS_ERROR_CQE_V1: terminal RNIC error state maps to verbs-style CQEs.
 
 namespace ns3 {
 
@@ -40,6 +42,12 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_retransBytes = 0;
 	m_nackCount = 0;
 	m_timeoutCount = 0;
+	m_rcRetryAttempts = 0;
+	m_rcRetryAttemptCount = 0;
+	m_rcRetryExhaustedCount = 0;
+	m_rcRetryExhausted = false;
+	m_qpError = false;
+	m_qpErrorStatus = RDMA_WR_CQE_SUCCESS;
 	m_deadlineSampleOutstanding = false;
 	m_deadlineSampleSeq = 0;
 	m_deadlineSampleTxNs = 0;
@@ -62,6 +70,8 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_ackRecoveryActive = false;
 	m_ackRecoveryPermit = false;
 	m_ackRecoveryProbeInFlight = false;
+	m_ackRecoveryPermitType = RNIC_ACK_PROBE_NONE;
+	m_ackRecoveryInFlightType = RNIC_ACK_PROBE_NONE;
 	m_ackRecoveryNextWindowStartNs = 0;
 	m_ackRecoveryLastArmWindowEndNs = 0;
 	m_ackRecoveryPermitWindowStartNs = 0;
@@ -73,6 +83,8 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_ackRecoveryAttempts = 0;
 	m_ackRecoveryArmCount = 0;
 	m_ackRecoveryProbeCount = 0;
+	m_ackRecoveryTailProbeCount = 0;
+	m_ackRecoveryPartialAckCount = 0;
 	m_ackRecoverySuccessCount = 0;
 	m_ackRecoveryDelayedAckCount = 0;
 	m_ackRecoveryNackCount = 0;
@@ -295,7 +307,14 @@ RdmaRxQueuePair::RdmaRxQueuePair(){
 	m_ipid = 0;
 	ReceiverNextExpectedSeq = 0;
 	m_nackTimer = Time(0);
-	m_milestone_rx = 0;
+	m_lastAckGeneratedSeq = 0;
+	m_ackDirty = false;
+	m_lastAckTos = 0;
+	m_ackCnpPending = false;
+	m_hasAckMetadata = false;
+	m_ackGeneratedCount = 0;
+	m_ackFlushCount = 0;
+	m_duplicateAckCount = 0;
 	m_lastNACK = 0;
 	m_hasBoundRnicPort = false;
 	m_boundRnicPort = 0;
