@@ -15,8 +15,10 @@
 // MODE2_CQE_SEMANTICS_V1: RNIC keeps signaled-WR boundaries internally.
 // MODE1_CONTINUATION_ACK_RECOVERY_V1: bounded next-window DATA probing.
 // MODE1_FINAL_ACK_RECOVERY_V1: receiver-window flush plus final-tail probing.
-// MODE2_RNIC_RC_RETRY_V1: stock-RNIC ACK timeout/retry below the verbs boundary.
-// MODE2_VERBS_ERROR_CQE_V1: retry exhaustion becomes error CQEs plus QP error teardown.
+// COMMON_RC_RELIABILITY_V1: RC ACK timeout/retry/error state is RNIC-local
+// and shared by all transport modes. Mode 0/2 use the vanilla timer policy;
+// Mode 1 can select schedule-aware recovery without importing userspace logic.
+// MODE2_VERBS_ERROR_CQE_V1: Mode-2 retry exhaustion is exposed as CQEs.
 
 namespace ns3 {
 
@@ -76,6 +78,12 @@ public:
 		SCALE_OUT_LEAST_QP = 2,
 		SCALE_OUT_TIME_HASH = 3
 	};
+
+	enum RcRetryPolicy {
+		RC_RETRY_DISABLED = 0,
+		RC_RETRY_VANILLA = 1,
+		RC_RETRY_SCHEDULE_AWARE = 2
+	};
 	uint32_t m_scaleOutPlaneScheduler;
 	std::unordered_map<uint32_t, uint32_t> m_scaleOutRrCursor;
 	// dst node -> stable RNIC ports that have at least one injection window
@@ -99,12 +107,22 @@ public:
 	// size is the configured MTU and the attempt bound is an RNIC constant.
 	bool m_rnicAckRecoveryEnabled;
 
-	// Mode-2 model of the RC reliability engine in a commodity RNIC. This is
-	// deliberately independent of RdmaTransport/OCS scheduling: a real RNIC
-	// retries according to its QP timer even when userspace has stopped posting.
-	bool m_rcAckRetryEnabled;
+	// Common RC reliability policy. Vanilla is a schedule-unaware local ACK
+	// timeout/retry engine (Mode 0 and Mode 2). Schedule-aware uses the same timer
+	// but filters timeout actions through Mode-1 RNIC window/deadline logic, so
+	// planned OFF time does not burn a blind retry budget.
+	RcRetryPolicy m_rcRetryPolicy;
 	uint64_t m_rcAckTimeoutNs;
 	uint32_t m_rcRetryCount;
+
+	// Optional, read-only QP state instrumentation. It is intentionally kept
+	// outside the RC/OCS state machines so enabling the trace cannot change
+	// transport decisions. sport=0 selects all sports for the src/dst pair.
+	bool m_qpStateTraceEnabled;
+	uint64_t m_qpStateTraceIntervalNs;
+	uint32_t m_qpStateTraceSrc;
+	uint32_t m_qpStateTraceDst;
+	uint16_t m_qpStateTraceSport;
 
 	uint32_t m_gpus_per_server; // uesed for routing; if src and dst in the same server, then communicate by nvswitch.
 	uint32_t nvls_enable;
@@ -209,10 +227,18 @@ public:
 	void UpdateRnicDeadlineRtt(Ptr<RdmaQueuePair> qp, uint64_t ackSeq);
 	void InvalidateRnicDeadlineSample(Ptr<RdmaQueuePair> qp);
 	void ConfigureRnicAckRecovery(bool enabled);
-	void ConfigureRcAckRetry(bool enabled,
+	void ConfigureRcAckRetry(RcRetryPolicy policy,
 	                         uint64_t ackTimeoutNs,
 	                         uint32_t retryCount);
+	void ConfigureQpStateTrace(bool enabled,
+	                           uint64_t intervalNs,
+	                           uint32_t src,
+	                           uint32_t dst,
+	                           uint16_t sport);
+	bool IsQpStateTraceTarget(Ptr<RdmaQueuePair> qp) const;
+	void TraceQpState(Ptr<RdmaQueuePair> qp);
 	bool IsRcAckRetryEnabled() const;
+	bool IsRcReliabilityEnabled() const;
 	void ArmRcAckTimeout(Ptr<RdmaQueuePair> qp, bool resetRetryBudget);
 	void CancelRcAckTimeout(Ptr<RdmaQueuePair> qp);
 	void HandleRcAckTimeout(Ptr<RdmaQueuePair> qp, uint64_t expectedUna);

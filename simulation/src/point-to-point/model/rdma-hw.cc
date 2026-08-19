@@ -22,8 +22,10 @@
 // MODE2_CQE_SEMANTICS_V1: complete WR boundaries generate CQE callbacks.
 // MODE1_CONTINUATION_ACK_RECOVERY_V1: bounded next-window DATA probing.
 // MODE1_FINAL_ACK_RECOVERY_V1: receiver-window flush plus final-tail probing.
-// MODE2_RNIC_RC_RETRY_V1: stock-RNIC ACK timeout/retry below the verbs boundary.
-// MODE2_VERBS_ERROR_CQE_V1: retry exhaustion becomes verbs-style error CQEs.
+// COMMON_RC_RELIABILITY_V1: RNIC-local RC timeout/retry/error state shared
+// across Mode 0/1/2. Mode 0/2 use vanilla ACK timers; Mode 1 may delegate
+// planned OCS-gap recovery to its schedule-aware RNIC policy.
+// MODE2_VERBS_ERROR_CQE_V1: Mode-2 retry exhaustion becomes verbs-style CQEs.
 
 namespace ns3{
 
@@ -281,9 +283,14 @@ RdmaHw::RdmaHw(){
 	m_rnicDeadlineMinRttSamples = 4;
 	m_rnicDeadlineRttVarMultiplier = 4;
 	m_rnicAckRecoveryEnabled = false;
-	m_rcAckRetryEnabled = false;
+	m_rcRetryPolicy = RC_RETRY_DISABLED;
 	m_rcAckTimeoutNs = 100000;
 	m_rcRetryCount = 7;
+	m_qpStateTraceEnabled = false;
+	m_qpStateTraceIntervalNs = 50000;
+	m_qpStateTraceSrc = 0;
+	m_qpStateTraceDst = 0;
+	m_qpStateTraceSport = 0;
 }
 
 void RdmaHw::enable_nvls() {
@@ -573,26 +580,138 @@ bool RdmaHw::IsRnicAckRecoveryEnabled() const{
 	return m_rnicAckRecoveryEnabled;
 }
 
-void RdmaHw::ConfigureRcAckRetry(bool enabled,
+void RdmaHw::ConfigureRcAckRetry(RcRetryPolicy policy,
                                  uint64_t ackTimeoutNs,
                                  uint32_t retryCount){
-	m_rcAckRetryEnabled = enabled && ackTimeoutNs != 0;
+	NS_ASSERT_MSG(policy >= RC_RETRY_DISABLED &&
+	              policy <= RC_RETRY_SCHEDULE_AWARE,
+	              "invalid RC retry policy");
+
+	m_rcRetryPolicy = policy;
 	m_rcAckTimeoutNs = ackTimeoutNs;
 	m_rcRetryCount = retryCount;
+
+	// Every enabled RC policy uses the same local ACK timer. Mode 1 filters
+	// timeout actions through its RNIC gate so planned OFF time does not consume
+	// the retry budget; Mode 0/2 use the vanilla schedule-unaware action.
+	if (m_rcRetryPolicy != RC_RETRY_DISABLED && m_rcAckTimeoutNs == 0){
+		m_rcRetryPolicy = RC_RETRY_DISABLED;
+	}
+
+	const char* policyName = "disabled";
+	const char* scheduleAwareness = "none";
+	if (m_rcRetryPolicy == RC_RETRY_VANILLA){
+		policyName = "vanilla_ack_timeout";
+	}else if (m_rcRetryPolicy == RC_RETRY_SCHEDULE_AWARE){
+		policyName = "schedule_aware_window_recovery";
+		scheduleAwareness = "rnic";
+	}
 
 	std::cout << "[RNIC RC RETRY CONFIG]"
 	          << " node="
 	          << (m_node != NULL ? static_cast<int64_t>(m_node->GetId()) : -1)
-	          << " enabled=" << (m_rcAckRetryEnabled ? 1 : 0)
+	          << " enabled=" << (IsRcReliabilityEnabled() ? 1 : 0)
+	          << " policy=" << policyName
+	          << " ack_timer=" << (IsRcAckRetryEnabled() ? 1 : 0)
 	          << " ack_timeout_ns=" << m_rcAckTimeoutNs
 	          << " retry_count=" << m_rcRetryCount
-	          << " schedule_awareness=none"
-	          << " owner=commodity_rnic"
+	          << " schedule_awareness=" << scheduleAwareness
+	          << " owner=common_rc"
 	          << std::endl;
 }
 
 bool RdmaHw::IsRcAckRetryEnabled() const{
-	return m_rcAckRetryEnabled;
+	return m_rcRetryPolicy != RC_RETRY_DISABLED;
+}
+
+bool RdmaHw::IsRcReliabilityEnabled() const{
+	return m_rcRetryPolicy != RC_RETRY_DISABLED;
+}
+
+void RdmaHw::ConfigureQpStateTrace(bool enabled,
+                                   uint64_t intervalNs,
+                                   uint32_t src,
+                                   uint32_t dst,
+                                   uint16_t sport){
+	m_qpStateTraceEnabled = enabled && intervalNs > 0;
+	m_qpStateTraceIntervalNs = intervalNs;
+	m_qpStateTraceSrc = src;
+	m_qpStateTraceDst = dst;
+	m_qpStateTraceSport = sport;
+
+	if (m_qpStateTraceEnabled){
+		std::cout << "[RNIC QP STATE TRACE CONFIG]"
+		          << " node="
+		          << (m_node != NULL ? static_cast<int64_t>(m_node->GetId()) : -1)
+		          << " enabled=1"
+		          << " interval_ns=" << m_qpStateTraceIntervalNs
+		          << " src=" << m_qpStateTraceSrc
+		          << " dst=" << m_qpStateTraceDst
+		          << " sport=" << m_qpStateTraceSport
+		          << " sport_wildcard=" << (m_qpStateTraceSport == 0 ? 1 : 0)
+		          << std::endl;
+	}
+}
+
+bool RdmaHw::IsQpStateTraceTarget(Ptr<RdmaQueuePair> qp) const{
+	if (!m_qpStateTraceEnabled || qp == NULL){
+		return false;
+	}
+	if (qp->m_src != m_qpStateTraceSrc || qp->m_dest != m_qpStateTraceDst){
+		return false;
+	}
+	return m_qpStateTraceSport == 0 || qp->sport == m_qpStateTraceSport;
+}
+
+void RdmaHw::TraceQpState(Ptr<RdmaQueuePair> qp){
+	if (!IsQpStateTraceTarget(qp)){
+		return;
+	}
+
+	// Stop the recurring trace after the QP has been removed. The scheduled
+	// event temporarily owns a Ptr<> reference, so this check also prevents a
+	// completed QP from being kept in an endless trace chain.
+	const uint64_t key = GetQpKey(qp->dip.Get(), qp->sport, qp->m_pg);
+	std::unordered_map<uint64_t, Ptr<RdmaQueuePair> >::const_iterator it =
+		m_qpMap.find(key);
+	if (it == m_qpMap.end() || it->second != qp){
+		return;
+	}
+
+	const uint64_t sentUnackedBytes =
+		qp->m_highestSentSeq > qp->snd_una
+			? qp->m_highestSentSeq - qp->snd_una
+			: 0;
+	const uint64_t cursorUnackedBytes =
+		qp->snd_nxt > qp->snd_una ? qp->snd_nxt - qp->snd_una : 0;
+
+	std::cout << "[RNIC QP STATE]"
+	          << " t_ns=" << Simulator::Now().GetNanoSeconds()
+	          << " node=" << (m_node != NULL ? static_cast<int64_t>(m_node->GetId()) : -1)
+	          << " src=" << qp->m_src
+	          << " dst=" << qp->m_dest
+	          << " sport=" << qp->sport
+	          << " dport=" << qp->dport
+	          << " pg=" << qp->m_pg
+	          << " snd_una=" << qp->snd_una
+	          << " snd_nxt=" << qp->snd_nxt
+	          << " highest_sent=" << qp->m_highestSentSeq
+	          << " sent_unacked_bytes=" << sentUnackedBytes
+	          << " cursor_unacked_bytes=" << cursorUnackedBytes
+                  << " retrans_packets=" << qp->m_retransPackets
+                  << " retrans_bytes=" << qp->m_retransBytes
+                  << " nack_count=" << qp->m_nackCount
+                  << " timeout_count=" << qp->m_timeoutCount
+	          << " posted_limit=" << qp->GetPostedLimit()
+	          << " qp_error=" << (qp->m_qpError ? 1 : 0)
+	          << std::endl;
+
+	if (!qp->m_qpError && !qp->IsFinished()){
+		Simulator::Schedule(NanoSeconds(m_qpStateTraceIntervalNs),
+		                    &RdmaHw::TraceQpState,
+		                    this,
+		                    qp);
+	}
 }
 
 void RdmaHw::CancelRcAckTimeout(Ptr<RdmaQueuePair> qp){
@@ -605,7 +724,7 @@ void RdmaHw::CancelRcAckTimeout(Ptr<RdmaQueuePair> qp){
 }
 
 void RdmaHw::ArmRcAckTimeout(Ptr<RdmaQueuePair> qp, bool resetRetryBudget){
-	if (!m_rcAckRetryEnabled || qp == NULL || qp->m_rcRetryExhausted){
+	if (!IsRcAckRetryEnabled() || qp == NULL || qp->m_rcRetryExhausted){
 		return;
 	}
 
@@ -636,7 +755,7 @@ void RdmaHw::HandleRcAckTimeout(Ptr<RdmaQueuePair> qp, uint64_t expectedUna){
 		qp->m_rcAckTimeoutEvent = EventId();
 	}
 
-	if (!m_rcAckRetryEnabled || qp == NULL || qp->m_rcRetryExhausted){
+	if (!IsRcAckRetryEnabled() || qp == NULL || qp->m_rcRetryExhausted){
 		return;
 	}
 
@@ -653,6 +772,57 @@ void RdmaHw::HandleRcAckTimeout(Ptr<RdmaQueuePair> qp, uint64_t expectedUna){
 	}
 
 	qp->m_timeoutCount++;
+
+	// Mode 1 shares the same RC timer, but a timeout that expires while its
+	// schedule/deadline gate says "do not transmit now" is a planned temporal
+	// gap, not evidence of packet loss. Defer the retry check until one ACK
+	// timeout after the next safe transmit opportunity without consuming budget.
+	if (m_rcRetryPolicy == RC_RETRY_SCHEDULE_AWARE &&
+		!RnicGateAllowsQp(qp)){
+		const Time now = Simulator::Now();
+		const Time nextGate = GetNextRnicGateTime(qp);
+		if (nextGate != Simulator::GetMaximumSimulationTime() &&
+			nextGate > now){
+			const uint64_t waitNs =
+				static_cast<uint64_t>((nextGate - now).GetNanoSeconds());
+			const uint64_t maxDelayNs =
+				static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+			uint64_t delayNs =
+				waitNs > maxDelayNs - std::min<uint64_t>(m_rcAckTimeoutNs, maxDelayNs)
+					? maxDelayNs
+					: waitNs + m_rcAckTimeoutNs;
+			delayNs = std::min<uint64_t>(delayNs, maxDelayNs);
+			const uint64_t deferredExpectedUna = qp->snd_una;
+			qp->m_rcAckTimeoutEvent = Simulator::Schedule(
+				NanoSeconds(static_cast<int64_t>(delayNs)),
+				&RdmaHw::HandleRcAckTimeout,
+				this,
+				qp,
+				deferredExpectedUna);
+			qp->m_rcTimeoutDeferredCount++;
+
+			std::cout << "[RNIC RC ACK TIMEOUT DEFER]"
+			          << " t_ns=" << now.GetNanoSeconds()
+			          << " node=" << m_node->GetId()
+			          << " src=" << qp->m_src
+			          << " dst=" << qp->m_dest
+			          << " sport=" << qp->sport
+			          << " dport=" << qp->dport
+			          << " snd_una=" << qp->snd_una
+			          << " highest_sent=" << qp->m_highestSentSeq
+			          << " next_gate_ns=" << nextGate.GetNanoSeconds()
+			          << " deferred_delay_ns=" << delayNs
+			          << " deferred_count=" << qp->m_rcTimeoutDeferredCount
+			          << " retry_budget_used=" << qp->m_rcRetryAttempts
+			          << " action=defer_planned_gap"
+			          << std::endl;
+			return;
+		}
+		// No finite safe gate opportunity is currently exposed. Fall through to
+		// the ordinary retry budget so a genuine persistent failure still ends in
+		// QP error instead of stalling forever.
+	}
+
 	const uint64_t retryStart = qp->snd_una;
 	const uint64_t retryEnd = qp->m_highestSentSeq;
 
@@ -670,7 +840,7 @@ void RdmaHw::HandleRcAckTimeout(Ptr<RdmaQueuePair> qp, uint64_t expectedUna){
 		          << " highest_sent=" << qp->m_highestSentSeq
 		          << " retries=" << qp->m_rcRetryAttempts
 		          << " retry_count=" << m_rcRetryCount
-		          << " action=qp_error_emit_error_cqes"
+		          << " action=qp_error"
 		          << std::endl;
 		QpError(qp, RDMA_WR_CQE_RETRY_EXC_ERR);
 		return;
@@ -691,13 +861,14 @@ void RdmaHw::HandleRcAckTimeout(Ptr<RdmaQueuePair> qp, uint64_t expectedUna){
 	          << " retry_end_seq=" << retryEnd
 	          << " attempt=" << qp->m_rcRetryAttempts
 	          << " retry_count=" << m_rcRetryCount
-	          << " schedule_awareness=none"
+	          << " schedule_awareness="
+	          << (m_rcRetryPolicy == RC_RETRY_SCHEDULE_AWARE ? "rnic" : "none")
 	          << " action=go_back_n_retransmit"
 	          << std::endl;
 
-	// Reuse the RNIC's existing Go-Back-N retransmission machinery. Mode 2
-	// clears the Mode-1 gate callbacks, so TriggerTransmit() below does not wait
-	// for an OCS window; this is intentional stock-RNIC behaviour.
+	// Reuse the RNIC's existing Go-Back-N retransmission machinery. The vanilla
+	// policy is intentionally schedule-unaware (Mode 0 and Mode 2), so the
+	// retry is driven only by the local ACK timer.
 	RecoverQueue(qp);
 	const uint32_t nicIdx = GetNicIdxOfQp(qp);
 	m_nic[nicIdx].dev->TriggerTransmit();
@@ -1143,6 +1314,19 @@ Ptr<RdmaQueuePair> RdmaHw::CreateQueuePair(uint32_t src, uint32_t dest, uint64_t
 	last_qp_cnp[key] = 0;
 	last_qp_rate[key] = 0;
 
+	if (IsQpStateTraceTarget(qp)){
+		std::cout << "[RNIC QP STATE TRACE START]"
+		          << " t_ns=" << Simulator::Now().GetNanoSeconds()
+		          << " node=" << (m_node != NULL ? static_cast<int64_t>(m_node->GetId()) : -1)
+		          << " src=" << qp->m_src
+		          << " dst=" << qp->m_dest
+		          << " sport=" << qp->sport
+		          << " dport=" << qp->dport
+		          << " interval_ns=" << m_qpStateTraceIntervalNs
+		          << std::endl;
+		TraceQpState(qp);
+	}
+
 	DataRate m_bps = m_nic[nic_idx].dev->GetDataRate();
 	qp->m_rate = m_bps;
 	qp->m_max_rate = m_bps;
@@ -1562,7 +1746,7 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 		rcAckProgress = qp->snd_una > oldUna;
 		if (ch.l3Prot == 0xFC){
 			HandleRnicAckRecoveryProgress(qp, oldUna, effectiveAckSeq);
-			if (m_rcAckRetryEnabled && qp->snd_una > oldUna){
+			if (IsRcAckRetryEnabled() && qp->snd_una > oldUna){
 				if (qp->snd_una < qp->m_highestSentSeq){
 					ArmRcAckTimeout(qp, true);
 				}else{
@@ -1580,7 +1764,7 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 	{
 		qp->m_nackCount++;
 		RecoverQueue(qp);
-		if (m_rcAckRetryEnabled){
+		if (IsRcAckRetryEnabled()){
 			// A transport NACK is a retransmission hint, not fresh retry
 			// budget. Periodic gap NACKs must not keep an RC QP alive
 			// forever while snd_una is stalled. Only cumulative forward
@@ -1735,6 +1919,7 @@ void RdmaHw::PrintQpTerminalStats(Ptr<RdmaQueuePair> qp, const char* terminal){
 	          << " nack_count=" << qp->m_nackCount
 	          << " timeout_count=" << qp->m_timeoutCount
 	          << " rc_retry_attempts_total=" << qp->m_rcRetryAttemptCount
+	          << " rc_timeout_deferred=" << qp->m_rcTimeoutDeferredCount
 	          << " rc_retry_budget_used=" << qp->m_rcRetryAttempts
 	          << " rc_retry_exhausted=" << qp->m_rcRetryExhaustedCount
 	          << " deadline_samples=" << qp->m_deadlineValidSamples
@@ -1789,6 +1974,7 @@ void RdmaHw::QpError(Ptr<RdmaQueuePair> qp, uint32_t status){
 	qp->m_qpError = true;
 	qp->m_qpErrorStatus = status;
 	ResetRnicAckRecoveryState(qp);
+	TraceQpState(qp);
 	PrintQpTerminalStats(qp, "error");
 
 	if (m_cc_mode == 1){
@@ -1797,9 +1983,15 @@ void RdmaHw::QpError(Ptr<RdmaQueuePair> qp, uint32_t status){
 		Simulator::Cancel(qp->mlx.m_rpTimer);
 	}
 
-	// Error CQEs are emitted before teardown, just as a userspace poller would
-	// observe the failed/flush completions before resources are destroyed.
-	GenerateWrErrorCompletions(qp);
+	// Only Mode 2 posts explicit WR records and observes verbs-style CQEs.
+	// Mode 0/1 share the RNIC RC error state but do not import userspace WR/CQ
+	// bookkeeping; their simulation-level QP completion callback is sufficient.
+	const uint64_t qpKey = GetQpKey(qp->dip.Get(), qp->sport, qp->m_pg);
+	std::map<uint64_t, std::deque<PostedWrRecord> >::const_iterator wrIt =
+		m_postedWrRecords.find(qpKey);
+	if (wrIt != m_postedWrRecords.end() && !wrIt->second.empty()){
+		GenerateWrErrorCompletions(qp);
+	}
 	m_qpCompleteCallback(qp);
 
 	const uint32_t nicIdx = GetNicIdxOfQp(qp);
@@ -1812,6 +2004,7 @@ void RdmaHw::QpError(Ptr<RdmaQueuePair> qp, uint32_t status){
 void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
 	NS_ASSERT(!m_qpCompleteCallback.IsNull());
 	CancelRcAckTimeout(qp);
+	TraceQpState(qp);
 	PrintQpTerminalStats(qp, "success");
 	if (m_cc_mode == 1){
 		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
@@ -2000,7 +2193,7 @@ void RdmaHw::PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap)
 			qp->m_deadlineLastAllowedWindowEndNs;
 	}
 
-	if (m_rcAckRetryEnabled &&
+	if (IsRcAckRetryEnabled() &&
 		!qp->m_rcRetryExhausted &&
 		qp->snd_una < qp->m_highestSentSeq &&
 		qp->m_rcAckTimeoutEvent.IsExpired()){

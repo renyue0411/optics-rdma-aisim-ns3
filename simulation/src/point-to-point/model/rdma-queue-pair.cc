@@ -8,8 +8,9 @@
 #include "rdma-queue-pair.h"
 
 // MODE1_CONTINUATION_ACK_RECOVERY_V1: bounded next-window DATA probing.
-// MODE2_RNIC_RC_RETRY_V1: commodity-RNIC-style ACK timeout/retry state.
-// MODE2_VERBS_ERROR_CQE_V1: terminal RNIC error state maps to verbs-style CQEs.
+// COMMON_RC_RELIABILITY_V1: RNIC-local RC timeout/retry/error state shared
+// across the transport modes.
+// MODE2_VERBS_ERROR_CQE_V1: Mode-2 terminal errors map to verbs-style CQEs.
 
 namespace ns3 {
 
@@ -44,6 +45,7 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_timeoutCount = 0;
 	m_rcRetryAttempts = 0;
 	m_rcRetryAttemptCount = 0;
+	m_rcTimeoutDeferredCount = 0;
 	m_rcRetryExhaustedCount = 0;
 	m_rcRetryExhausted = false;
 	m_qpError = false;

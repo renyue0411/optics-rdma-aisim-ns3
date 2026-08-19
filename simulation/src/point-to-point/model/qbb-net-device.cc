@@ -701,6 +701,19 @@ namespace ns3 {
 			uint32_t sid = (sip >> 8) & 0xffff;
 			uint32_t dip = ch.dip;
 			uint32_t did = (dip >> 8) & 0xffff;
+
+			// A host NIC must never consume a packet addressed to another node.
+			// This matters for transparent OCS fabrics: during a different
+			// circuit slice, an unaware sender's packet may physically arrive
+			// at the wrong host. The optical fabric should still deliver the
+			// signal, but the wrong host must silently discard the packet rather
+			// than create RDMA RX state and generate ACK/NACK feedback.
+			if (m_node->GetNodeType() == 0 &&
+			    did != m_node->GetId()){
+				m_traceDrop(packet, 0);
+				return;
+			}
+
 			if (m_node->GetNodeType() > 0 && ch.m_tos != 4 && did != m_node->GetId()){ // switch
 				// std::cout << "id: " << m_node->GetId() << " switch receive from " << sid << std::endl;
 				packet->AddPacketTag(FlowIdTag(m_ifIndex));

@@ -12,8 +12,9 @@
 
 // MODE1_CONTINUATION_ACK_RECOVERY_V1: bounded next-window DATA probing.
 // MODE1_FINAL_ACK_RECOVERY_V1: receiver-window flush plus final-tail probing.
-// MODE2_RNIC_RC_RETRY_V1: commodity-RNIC-style ACK timeout/retry state.
-// MODE2_VERBS_ERROR_CQE_V1: expose RNIC failures only as CQE status to userspace.
+// COMMON_RC_RELIABILITY_V1: RNIC-local RC timeout/retry/error state shared
+// across Mode 0/1/2; userspace-specific CQE bookkeeping remains Mode 2 only.
+// MODE2_VERBS_ERROR_CQE_V1: expose Mode-2 RNIC failures as CQE status.
 
 namespace ns3 {
 
@@ -44,12 +45,13 @@ public:
 	uint64_t m_nackCount;
 	uint64_t m_timeoutCount;
 
-	// Mode-2 commodity-RNIC RC reliability state. Userspace never reads these
-	// fields; it observes only the resulting WR CQEs. The timer is intentionally
-	// schedule-unaware, matching a stock RNIC that does not know the OCS table.
+	// Common RC reliability state. Mode 0/2 use the schedule-unaware local ACK
+	// timer. Mode 1 retains the same QP error/retry state but handles planned OCS
+	// gaps with its RNIC schedule-aware recovery policy.
 	EventId m_rcAckTimeoutEvent;
 	uint32_t m_rcRetryAttempts;
 	uint64_t m_rcRetryAttemptCount;
+	uint64_t m_rcTimeoutDeferredCount;
 	uint64_t m_rcRetryExhaustedCount;
 	bool m_rcRetryExhausted;
 	bool m_qpError;
