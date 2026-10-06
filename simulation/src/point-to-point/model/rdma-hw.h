@@ -39,6 +39,8 @@ public:
 	static TypeId GetTypeId (void);
 	RdmaHw();
 
+	static void PrintGlobalEcnUsefulStats();
+
 	Ptr<Node> m_node;
 	DataRate m_minRate;		//< Min sending rate
 	uint32_t m_mtu;
@@ -118,6 +120,8 @@ public:
 	// Optional, read-only QP state instrumentation. It is intentionally kept
 	// outside the RC/OCS state machines so enabling the trace cannot change
 	// transport decisions. sport=0 selects all sports for the src/dst pair.
+	bool m_flowRxTraceEnabled;
+	bool m_rcEventTraceEnabled = true;
 	bool m_qpStateTraceEnabled;
 	uint64_t m_qpStateTraceIntervalNs;
 	uint32_t m_qpStateTraceSrc;
@@ -230,6 +234,8 @@ public:
 	void ConfigureRcAckRetry(RcRetryPolicy policy,
 	                         uint64_t ackTimeoutNs,
 	                         uint32_t retryCount);
+	void ConfigureFlowRxTrace(bool enabled);
+	void ConfigureRcEventTrace(bool enabled);
 	void ConfigureQpStateTrace(bool enabled,
 	                           uint64_t intervalNs,
 	                           uint32_t src,

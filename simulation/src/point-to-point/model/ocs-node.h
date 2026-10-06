@@ -93,6 +93,7 @@ public:
 
   /** Return whether schedule mode is enabled. */
   bool IsScheduleEnabled() const;
+  void ConfigureDropTrace(bool enabled);
 
   /** Return whether current time is inside the switching blackout window. */
   bool IsInSwitchingTime() const;
@@ -150,6 +151,7 @@ private:
 
   // Time-sliced schedule:
   //   (inPort, slice) -> outPort
+  bool m_dropTraceEnabled = true;
   bool m_scheduleEnabled;
   uint32_t m_numSlices;
   Time m_epochStart;

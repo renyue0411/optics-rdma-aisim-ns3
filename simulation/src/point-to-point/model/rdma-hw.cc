@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <iostream>	// debug
 #include <limits>
+#include <inttypes.h>
 
 // MODE2_CQE_SEMANTICS_V1: complete WR boundaries generate CQE callbacks.
 // MODE1_CONTINUATION_ACK_RECOVERY_V1: bounded next-window DATA probing.
@@ -32,6 +33,8 @@ namespace ns3{
 const uint64_t RdmaHw::FLOW_RX_BUCKET_NS;
 std::map<RdmaHw::FlowRxTraceKey, uint64_t> RdmaHw::m_flowRxBytes;
 std::set<RdmaHw::FlowRxTraceKey> RdmaHw::m_flowRxScheduled;
+static uint64_t g_deliveredUsefulBytes = 0;
+static uint64_t g_ceMarkedDeliveredUsefulBytes = 0;
 
 bool
 RdmaHw::FlowRxTraceKey::operator< (const FlowRxTraceKey &other) const
@@ -286,11 +289,21 @@ RdmaHw::RdmaHw(){
 	m_rcRetryPolicy = RC_RETRY_DISABLED;
 	m_rcAckTimeoutNs = 100000;
 	m_rcRetryCount = 7;
+	m_flowRxTraceEnabled = false;
 	m_qpStateTraceEnabled = false;
 	m_qpStateTraceIntervalNs = 50000;
 	m_qpStateTraceSrc = 0;
 	m_qpStateTraceDst = 0;
 	m_qpStateTraceSport = 0;
+}
+
+void RdmaHw::PrintGlobalEcnUsefulStats(){
+    std::cout << "[RNIC ECN USEFUL STATS]"
+              << " delivered_bytes=" << g_deliveredUsefulBytes
+              << " ce_marked_bytes=" << g_ceMarkedDeliveredUsefulBytes
+              << " unmarked_bytes="
+              << (g_deliveredUsefulBytes - g_ceMarkedDeliveredUsefulBytes)
+              << std::endl;
 }
 
 void RdmaHw::enable_nvls() {
@@ -628,6 +641,14 @@ bool RdmaHw::IsRcReliabilityEnabled() const{
 	return m_rcRetryPolicy != RC_RETRY_DISABLED;
 }
 
+void RdmaHw::ConfigureFlowRxTrace(bool enabled){
+	m_flowRxTraceEnabled = enabled;
+}
+
+void RdmaHw::ConfigureRcEventTrace(bool enabled){
+	m_rcEventTraceEnabled = enabled;
+}
+
 void RdmaHw::ConfigureQpStateTrace(bool enabled,
                                    uint64_t intervalNs,
                                    uint32_t src,
@@ -848,23 +869,26 @@ void RdmaHw::HandleRcAckTimeout(Ptr<RdmaQueuePair> qp, uint64_t expectedUna){
 
 	qp->m_rcRetryAttempts++;
 	qp->m_rcRetryAttemptCount++;
-	std::cout << "[RNIC RC ACK TIMEOUT]"
-	          << " t_ns=" << Simulator::Now().GetNanoSeconds()
-	          << " node=" << m_node->GetId()
-	          << " src=" << qp->m_src
-	          << " dst=" << qp->m_dest
-	          << " sport=" << qp->sport
-	          << " dport=" << qp->dport
-	          << " snd_una=" << qp->snd_una
-	          << " highest_sent=" << qp->m_highestSentSeq
-	          << " retry_start_seq=" << retryStart
-	          << " retry_end_seq=" << retryEnd
-	          << " attempt=" << qp->m_rcRetryAttempts
-	          << " retry_count=" << m_rcRetryCount
-	          << " schedule_awareness="
-	          << (m_rcRetryPolicy == RC_RETRY_SCHEDULE_AWARE ? "rnic" : "none")
-	          << " action=go_back_n_retransmit"
-	          << std::endl;
+	if (m_rcEventTraceEnabled)
+	{
+  	std::cout << "[RNIC RC ACK TIMEOUT]"
+  	          << " t_ns=" << Simulator::Now().GetNanoSeconds()
+  	          << " node=" << m_node->GetId()
+  	          << " src=" << qp->m_src
+  	          << " dst=" << qp->m_dest
+  	          << " sport=" << qp->sport
+  	          << " dport=" << qp->dport
+  	          << " snd_una=" << qp->snd_una
+  	          << " highest_sent=" << qp->m_highestSentSeq
+  	          << " retry_start_seq=" << retryStart
+  	          << " retry_end_seq=" << retryEnd
+  	          << " attempt=" << qp->m_rcRetryAttempts
+  	          << " retry_count=" << m_rcRetryCount
+  	          << " schedule_awareness="
+  	          << (m_rcRetryPolicy == RC_RETRY_SCHEDULE_AWARE ? "rnic" : "none")
+  	          << " action=go_back_n_retransmit"
+  	          << std::endl;
+	}
 
 	// Reuse the RNIC's existing Go-Back-N retransmission machinery. The vanilla
 	// policy is intentionally schedule-unaware (Mode 0 and Mode 2), so the
@@ -1157,14 +1181,14 @@ void RdmaHw::BindTxQpToNic(Ptr<RdmaQueuePair> qp, uint32_t nicIdx){
 	qp->m_boundPhysicalNicId = identity.physicalNicId;
 	qp->m_boundPlaneId = identity.planeId;
 
-	std::cout << "[QP PLANE BIND] node=" << m_node->GetId()
-	          << " src=" << qp->m_src
-	          << " dst=" << qp->m_dest
-	          << " sport=" << qp->sport
-	          << " nic=" << identity.physicalNicId
-	          << " plane=" << identity.planeId
-	          << " ifindex=" << nicIdx
-	          << std::endl;
+	// std::cout << "[QP PLANE BIND] node=" << m_node->GetId()
+	//           << " src=" << qp->m_src
+	//           << " dst=" << qp->m_dest
+	//           << " sport=" << qp->sport
+	//           << " nic=" << identity.physicalNicId
+	//           << " plane=" << identity.planeId
+	//           << " ifindex=" << nicIdx
+	//           << std::endl;
 }
 
 void RdmaHw::BindRxQpToIngress(Ptr<RdmaRxQueuePair> qp, uint32_t nicIdx){
@@ -1648,19 +1672,29 @@ int RdmaHw::ReceiveUdp(Ptr<QbbNetDevice> ingressDev, Ptr<Packet> p, CustomHeader
 
 	int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
 	const uint64_t acceptedBytes =
-		rxQp->ReceiverNextExpectedSeq > oldExpected
-			? rxQp->ReceiverNextExpectedSeq - oldExpected
-			: 0;
+			rxQp->ReceiverNextExpectedSeq > oldExpected
+					? rxQp->ReceiverNextExpectedSeq - oldExpected
+					: 0;
+
 	if (acceptedBytes != 0){
-		rxQp->m_ackDirty = true;
-		const uint32_t srcNode = (ch.sip >> 8) & 0xffff;
-		const uint32_t dstNode = (ch.dip >> 8) & 0xffff;
-		RecordFlowRxBytes(srcNode,
-		                  dstNode,
-		                  ch.udp.sport,
-		                  ch.udp.dport,
-		                  ch.udp.pg,
-		                  static_cast<uint32_t>(acceptedBytes));
+			g_deliveredUsefulBytes += acceptedBytes;
+
+			// IPv4 ECN CE codepoint = 0b11.
+			if (ecnbits == 0x03){
+					g_ceMarkedDeliveredUsefulBytes += acceptedBytes;
+			}
+
+			rxQp->m_ackDirty = true;
+		if (m_flowRxTraceEnabled){
+			const uint32_t srcNode = (ch.sip >> 8) & 0xffff;
+			const uint32_t dstNode = (ch.dip >> 8) & 0xffff;
+			RecordFlowRxBytes(srcNode,
+			                  dstNode,
+			                  ch.udp.sport,
+			                  ch.udp.dport,
+			                  ch.udp.pg,
+			                  static_cast<uint32_t>(acceptedBytes));
+		}
 	}
 
 	if (x == 1){
@@ -1905,6 +1939,12 @@ void RdmaHw::PrintQpTerminalStats(Ptr<RdmaQueuePair> qp, const char* terminal){
 	if (qp == NULL){
 		return;
 	}
+
+#ifdef NS3_MTP
+	// Protect terminal telemetry only. This does not change
+	// RDMA state, timers, packet processing, or scheduling.
+	MtpInterface::explicitCriticalSection cs;
+#endif
 	std::cout << "[RNIC RETRANSMISSION STATS]"
 	          << " node=" << m_node->GetId()
 	          << " src=" << qp->m_src
@@ -1962,6 +2002,10 @@ void RdmaHw::PrintQpTerminalStats(Ptr<RdmaQueuePair> qp, const char* terminal){
 	          << " qp_error=" << (qp->m_qpError ? 1 : 0)
 	          << " qp_error_status=" << qp->m_qpErrorStatus
 	          << std::endl;
+#ifdef NS3_MTP
+	cs.ExitSection();
+#endif
+
 }
 
 void RdmaHw::QpError(Ptr<RdmaQueuePair> qp, uint32_t status){
@@ -2252,17 +2296,28 @@ void RdmaHw::PrintHostBW(FILE* bw_output, uint32_t bw_mon_interval){
  * time, src, dst, sport, dport, size, rate
 */
 void RdmaHw::PrintQPRate(FILE* rate_output){
-	std::unordered_map<uint64_t, Ptr<RdmaQueuePair>>::iterator it = m_qpMap.begin();
-	for(; it != m_qpMap.end(); it++){
-		Ptr<RdmaQueuePair> qp = it->second;
-		uint64_t key = it->first;
-		if(qp->m_rate.GetBitRate() == last_qp_rate[key]){
-			continue;
-		}
-		fprintf(rate_output, "%lu, %u, %u, %u, %u, %u, %u\n", Simulator::Now().GetTimeStep(), qp->m_src, qp->m_dest, qp->sport, qp->dport, qp->m_size, qp->m_rate.GetBitRate());
-		fflush(rate_output);
-		last_qp_rate[key] = qp->m_rate.GetBitRate();
-	}
+    std::unordered_map<uint64_t, Ptr<RdmaQueuePair>>::iterator it = m_qpMap.begin();
+    for(; it != m_qpMap.end(); it++){
+        Ptr<RdmaQueuePair> qp = it->second;
+        uint64_t key = it->first;
+        uint64_t rate = qp->m_rate.GetBitRate();
+
+        if(rate == last_qp_rate[key]){
+            continue;
+        }
+
+        fprintf(rate_output,
+                "%ld, %u, %u, %u, %u, %" PRIu64 ", %" PRIu64 "\n",
+                Simulator::Now().GetTimeStep(),
+                qp->m_src,
+                qp->m_dest,
+                qp->sport,
+                qp->dport,
+                static_cast<uint64_t>(qp->m_size),
+                rate);
+
+        last_qp_rate[key] = rate;
+    }
 }
 /**
  * output format:

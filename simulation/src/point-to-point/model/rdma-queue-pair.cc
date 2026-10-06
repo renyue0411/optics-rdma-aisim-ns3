@@ -249,6 +249,14 @@ uint32_t RdmaQueuePair::GetHash(void){
 void RdmaQueuePair::Acknowledge(uint64_t ack){
 	if (ack > snd_una){
 		snd_una = ack;
+
+		// RecoverQueue() may rewind snd_nxt while ACKs for already
+		// transmitted packets are still in flight. A cumulative ACK
+		// can then advance snd_una beyond snd_nxt. Keep the send
+		// cursor out of already acknowledged sequence space.
+		if (snd_nxt < snd_una){
+			snd_nxt = snd_una;
+		}
 	}
 }
 

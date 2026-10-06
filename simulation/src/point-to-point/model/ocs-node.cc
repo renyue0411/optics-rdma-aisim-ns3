@@ -234,6 +234,12 @@ OcsNode::GetCurrentSlice() const
   return static_cast<uint32_t>((elapsed / sliceTicks) % m_numSlices);
 }
 
+void
+OcsNode::ConfigureDropTrace(bool enabled)
+{
+  m_dropTraceEnabled = enabled;
+}
+
 bool
 OcsNode::IsScheduleEnabled() const
 {
@@ -397,18 +403,21 @@ OcsNode::SwitchReceiveFromDevice(Ptr<NetDevice> device,
     {
       m_dropNoCircuit++;
 
-      std::cout << "[OCS DROP NO_CIRCUIT]"
-                << " t=" << Simulator::Now().GetTimeStep()
-                << " node=" << GetId()
-                << " inPort=" << inPort;
-
-      if (m_scheduleEnabled)
-        {
-          std::cout << " slice=" << GetCurrentSlice();
-        }
-
-      std::cout << " drop_no_circuit=" << m_dropNoCircuit
-                << std::endl;
+      if (m_dropTraceEnabled)
+      {
+        std::cout << "[OCS DROP NO_CIRCUIT]"
+                  << " t=" << Simulator::Now().GetTimeStep()
+                  << " node=" << GetId()
+                  << " inPort=" << inPort;
+  
+        if (m_scheduleEnabled)
+          {
+            std::cout << " slice=" << GetCurrentSlice();
+          }
+  
+        std::cout << " drop_no_circuit=" << m_dropNoCircuit
+                  << std::endl;
+      }
 
       return true;
     }
