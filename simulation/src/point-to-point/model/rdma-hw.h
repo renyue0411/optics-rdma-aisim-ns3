@@ -96,6 +96,7 @@ public:
 	typedef Callback<Time, Ptr<RdmaQueuePair> > RnicGateNextTimeCallback;
 	RnicGateAllowCallback m_rnicGateAllowCallback;
 	RnicGateNextTimeCallback m_rnicGateNextTimeCallback;
+	RnicGateNextTimeCallback m_rnicRetryNextTimeCallback;
 
 	// Mode-1 dynamic deadline configuration. Values are in nanoseconds.
 	bool m_rnicDeadlineEnabled;
@@ -116,6 +117,14 @@ public:
 	RcRetryPolicy m_rcRetryPolicy;
 	uint64_t m_rcAckTimeoutNs;
 	uint32_t m_rcRetryCount;
+	// Experimental controls; disabled unless explicitly set in the environment.
+	bool m_testRetryAtReopen;
+	bool m_testDropFinalAckOnce;
+	uint32_t m_testDropTailAckPackets;
+	uint64_t m_testDropAckUntilNs;
+	uint32_t m_testDropAckSrc;
+	uint32_t m_testDropAckDst;
+	uint16_t m_testDropAckSport;
 
 	// Optional, read-only QP state instrumentation. It is intentionally kept
 	// outside the RC/OCS state machines so enabling the trace cannot change
@@ -216,7 +225,8 @@ public:
 	void GenerateWrCompletions(Ptr<RdmaQueuePair> qp);
 	void GenerateWrErrorCompletions(Ptr<RdmaQueuePair> qp);
 	void SetRnicGateCallbacks(RnicGateAllowCallback allowCb,
-	                          RnicGateNextTimeCallback nextTimeCb);
+	                          RnicGateNextTimeCallback nextTimeCb,
+	                          RnicGateNextTimeCallback retryNextTimeCb = RnicGateNextTimeCallback());
 	void ClearRnicGateCallbacks();
 	bool RnicGateAllowsQp(Ptr<RdmaQueuePair> qp) const;
 	Time GetNextRnicGateTime(Ptr<RdmaQueuePair> qp) const;

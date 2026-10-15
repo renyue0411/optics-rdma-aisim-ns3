@@ -100,7 +100,8 @@ RdmaTransport::SetRdmaHw(Ptr<RdmaHw> rdma)
     {
         m_rdma->SetRnicGateCallbacks(
             MakeCallback(&RdmaTransport::RnicGateAllowsQp, this),
-            MakeCallback(&RdmaTransport::GetNextRnicGateTime, this));
+            MakeCallback(&RdmaTransport::GetNextRnicGateTime, this),
+            MakeCallback(&RdmaTransport::GetNextRnicRetryTime, this));
     }
     RefreshRnicAckFlushEvents();
 }
@@ -127,7 +128,8 @@ RdmaTransport::SetMode(uint32_t mode)
         {
             m_rdma->SetRnicGateCallbacks(
                 MakeCallback(&RdmaTransport::RnicGateAllowsQp, this),
-                MakeCallback(&RdmaTransport::GetNextRnicGateTime, this));
+                MakeCallback(&RdmaTransport::GetNextRnicGateTime, this),
+                MakeCallback(&RdmaTransport::GetNextRnicRetryTime, this));
         }
         else
         {
@@ -958,6 +960,42 @@ RdmaTransport::RnicGateAllowsQp(Ptr<RdmaQueuePair> qp) const
 
     ArmRnicAckRecovery(qp, gate, "window_bound");
     return false;
+}
+
+Time
+RdmaTransport::GetNextRnicRetryTime(Ptr<RdmaQueuePair> qp) const
+{
+    const Time now = Simulator::Now();
+    if (m_mode != MODE_RNIC)
+    {
+        return now;
+    }
+    if (qp == NULL)
+    {
+        return Simulator::GetMaximumSimulationTime();
+    }
+    const GateLookupResult gate = LookupGate(qp, now);
+    if (gate.bypass)
+    {
+        return now;
+    }
+    if (!gate.allowed)
+    {
+        return gate.nextAllowedTime;
+    }
+    if (m_rdma != NULL && m_rdma->IsRnicDeadlineEnabled())
+    {
+        const uint64_t candidateNs = static_cast<uint64_t>(
+            std::max(now, qp->m_nextAvail).GetNanoSeconds());
+        const uint64_t endNs =
+            static_cast<uint64_t>(gate.currentWindowEnd.GetNanoSeconds());
+        const uint64_t reserveNs = m_rdma->GetRnicDeadlineReserveNs(qp);
+        if (!(candidateNs <= endNs && reserveNs <= endNs - candidateNs))
+        {
+            return GetNextPhysicalWindowStart(qp, gate);
+        }
+    }
+    return now;
 }
 
 Time

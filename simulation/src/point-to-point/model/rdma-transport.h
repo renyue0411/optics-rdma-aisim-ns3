@@ -106,6 +106,9 @@ public:
     // Mode-1 callbacks invoked from the RdmaHw egress scheduling point.
     bool RnicGateAllowsQp(Ptr<RdmaQueuePair> qp) const;
     Time GetNextRnicGateTime(Ptr<RdmaQueuePair> qp) const;
+    // Pure reachability/deadline query for RC retries. Flow-control and a
+    // pending probe are not evidence of a planned connectivity gap.
+    Time GetNextRnicRetryTime(Ptr<RdmaQueuePair> qp) const;
 
     void ClearGateTables();
 

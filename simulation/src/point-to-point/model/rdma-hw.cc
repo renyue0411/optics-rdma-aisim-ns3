@@ -16,9 +16,12 @@
 #include "ns3/mtp-interface.h"
 #endif
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
 #include <iostream>	// debug
 #include <limits>
 #include <inttypes.h>
+#include "ns3/abort.h"
 
 // MODE2_CQE_SEMANTICS_V1: complete WR boundaries generate CQE callbacks.
 // MODE1_CONTINUATION_ACK_RECOVERY_V1: bounded next-window DATA probing.
@@ -29,6 +32,27 @@
 // MODE2_VERBS_ERROR_CQE_V1: Mode-2 retry exhaustion becomes verbs-style CQEs.
 
 namespace ns3{
+
+namespace {
+uint64_t ReadRecoveryExperimentEnv(const char* name, uint64_t defaultValue,
+                                   uint64_t maximum){
+	const char* value = std::getenv(name);
+	if (value == NULL){
+		return defaultValue;
+	}
+	NS_ABORT_MSG_IF(value[0] == '\0', "Empty experiment option: " << name);
+	for (const char* p = value; *p != '\0'; ++p){
+		NS_ABORT_MSG_IF(*p < '0' || *p > '9',
+		                "Expected an unsigned decimal integer: " << name);
+	}
+	errno = 0;
+	char* end = NULL;
+	const unsigned long long parsed = std::strtoull(value, &end, 10);
+	NS_ABORT_MSG_IF(errno == ERANGE || *end != '\0' || parsed > maximum,
+	                "Experiment option out of range: " << name);
+	return static_cast<uint64_t>(parsed);
+}
+} // namespace
 
 const uint64_t RdmaHw::FLOW_RX_BUCKET_NS;
 std::map<RdmaHw::FlowRxTraceKey, uint64_t> RdmaHw::m_flowRxBytes;
@@ -289,6 +313,23 @@ RdmaHw::RdmaHw(){
 	m_rcRetryPolicy = RC_RETRY_DISABLED;
 	m_rcAckTimeoutNs = 100000;
 	m_rcRetryCount = 7;
+	m_testRetryAtReopen = ReadRecoveryExperimentEnv(
+		"TSRDMA_TEST_RETRY_AT_REOPEN", 0, 1) != 0;
+	m_testDropFinalAckOnce = ReadRecoveryExperimentEnv(
+		"TSRDMA_TEST_DROP_FINAL_ACK_ONCE", 0, 1) != 0;
+	m_testDropTailAckPackets = ReadRecoveryExperimentEnv(
+		"TSRDMA_TEST_DROP_TAIL_ACK_PACKETS", 0, std::numeric_limits<uint32_t>::max());
+	m_testDropAckUntilNs = ReadRecoveryExperimentEnv(
+		"TSRDMA_TEST_DROP_ACK_UNTIL_NS", 0, std::numeric_limits<int64_t>::max());
+	NS_ABORT_MSG_IF(m_testDropTailAckPackets != 0 &&
+	                (m_testDropFinalAckOnce || m_testDropAckUntilNs == 0),
+	                "Tail-ACK test requires an end time and excludes final-ACK-once mode");
+	m_testDropAckSrc = ReadRecoveryExperimentEnv(
+		"TSRDMA_TEST_DROP_ACK_SRC", 0, std::numeric_limits<uint32_t>::max());
+	m_testDropAckDst = ReadRecoveryExperimentEnv(
+		"TSRDMA_TEST_DROP_ACK_DST", 4, std::numeric_limits<uint32_t>::max());
+	m_testDropAckSport = ReadRecoveryExperimentEnv(
+		"TSRDMA_TEST_DROP_ACK_SPORT", 10000, std::numeric_limits<uint16_t>::max());
 	m_flowRxTraceEnabled = false;
 	m_qpStateTraceEnabled = false;
 	m_qpStateTraceIntervalNs = 50000;
@@ -536,14 +577,17 @@ void RdmaHw::GenerateWrErrorCompletions(Ptr<RdmaQueuePair> qp){
 }
 
 void RdmaHw::SetRnicGateCallbacks(RnicGateAllowCallback allowCb,
-                                      RnicGateNextTimeCallback nextTimeCb){
+                                      RnicGateNextTimeCallback nextTimeCb,
+                                      RnicGateNextTimeCallback retryNextTimeCb){
 	m_rnicGateAllowCallback = allowCb;
 	m_rnicGateNextTimeCallback = nextTimeCb;
+	m_rnicRetryNextTimeCallback = retryNextTimeCb;
 }
 
 void RdmaHw::ClearRnicGateCallbacks(){
 	m_rnicGateAllowCallback = RnicGateAllowCallback();
 	m_rnicGateNextTimeCallback = RnicGateNextTimeCallback();
+	m_rnicRetryNextTimeCallback = RnicGateNextTimeCallback();
 }
 
 void RdmaHw::ConfigureRnicDeadline(bool enabled,
@@ -794,24 +838,27 @@ void RdmaHw::HandleRcAckTimeout(Ptr<RdmaQueuePair> qp, uint64_t expectedUna){
 
 	qp->m_timeoutCount++;
 
-	// Mode 1 shares the same RC timer, but a timeout that expires while its
-	// schedule/deadline gate says "do not transmit now" is a planned temporal
-	// gap, not evidence of packet loss. Defer the retry check until one ACK
-	// timeout after the next safe transmit opportunity without consuming budget.
-	if (m_rcRetryPolicy == RC_RETRY_SCHEDULE_AWARE &&
-		!RnicGateAllowsQp(qp)){
+	// Only physical unreachability or the DATA/ACK deadline can defer an RC
+	// timeout as a planned gap. The regular scheduler also blocks final-tail
+	// QPs while waiting for a probe; that must not suppress a valid ON-window
+	// RC retry. This query is read-only and does not arm a probe as a side effect.
+	if (m_rcRetryPolicy == RC_RETRY_SCHEDULE_AWARE){
 		const Time now = Simulator::Now();
-		const Time nextGate = GetNextRnicGateTime(qp);
+		const Time nextGate = m_rnicRetryNextTimeCallback.IsNull()
+			? now : m_rnicRetryNextTimeCallback(qp);
 		if (nextGate != Simulator::GetMaximumSimulationTime() &&
 			nextGate > now){
 			const uint64_t waitNs =
 				static_cast<uint64_t>((nextGate - now).GetNanoSeconds());
 			const uint64_t maxDelayNs =
 				static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+			// The default preserves the existing next-window + RTO policy.
+			// The opt-in experiment baseline retries immediately at reopening.
+			const uint64_t graceNs = m_testRetryAtReopen ? 0 : m_rcAckTimeoutNs;
 			uint64_t delayNs =
-				waitNs > maxDelayNs - std::min<uint64_t>(m_rcAckTimeoutNs, maxDelayNs)
+				waitNs > maxDelayNs - std::min<uint64_t>(graceNs, maxDelayNs)
 					? maxDelayNs
-					: waitNs + m_rcAckTimeoutNs;
+					: waitNs + graceNs;
 			delayNs = std::min<uint64_t>(delayNs, maxDelayNs);
 			const uint64_t deferredExpectedUna = qp->snd_una;
 			qp->m_rcAckTimeoutEvent = Simulator::Schedule(
@@ -833,6 +880,7 @@ void RdmaHw::HandleRcAckTimeout(Ptr<RdmaQueuePair> qp, uint64_t expectedUna){
 			          << " highest_sent=" << qp->m_highestSentSeq
 			          << " next_gate_ns=" << nextGate.GetNanoSeconds()
 			          << " deferred_delay_ns=" << delayNs
+			          << " retry_at_reopen=" << (m_testRetryAtReopen ? 1 : 0)
 			          << " deferred_count=" << qp->m_rcTimeoutDeferredCount
 			          << " retry_budget_used=" << qp->m_rcRetryAttempts
 			          << " action=defer_planned_gap"
@@ -1761,6 +1809,49 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 	int i;
 	Ptr<RdmaQueuePair> qp = GetQp(ch.sip, port, qIndex);
 	if (qp == NULL){
+		return 0;
+	}
+
+	// Deterministic endpoint fault injection. The receiver has already
+	// generated and transmitted this ACK, but it is discarded before sender
+	// ACK processing. Do not synthesize loss by changing either endpoint's
+	// sequence state. Tail mode discards ACKs covering the last K payloads
+	// only before the explicit cutoff; subsequent recovery ACKs pass normally.
+	if (m_testDropTailAckPackets != 0 && ch.l3Prot == 0xFC &&
+		qp->m_src == m_testDropAckSrc && qp->m_dest == m_testDropAckDst &&
+		qp->sport == m_testDropAckSport &&
+		static_cast<uint64_t>(Simulator::Now().GetNanoSeconds()) < m_testDropAckUntilNs){
+		const uint64_t tailBytes = static_cast<uint64_t>(m_testDropTailAckPackets) * m_mtu;
+		NS_ABORT_MSG_IF(tailBytes > qp->m_size,
+		                "Tail-ACK test range exceeds the selected flow size");
+		if (seq > qp->m_size - tailBytes && seq <= qp->m_size){
+			std::cout << "[RNIC TEST ACK DROP]"
+			          << " t_ns=" << Simulator::Now().GetNanoSeconds()
+			          << " node=" << m_node->GetId()
+			          << " src=" << qp->m_src << " dst=" << qp->m_dest
+			          << " sport=" << qp->sport << " ack_seq=" << seq
+			          << " snd_una=" << qp->snd_una
+			          << " highest_sent=" << qp->m_highestSentSeq
+			          << " tail_packets=" << m_testDropTailAckPackets
+			          << " until_ns=" << m_testDropAckUntilNs
+			          << " action=discard_tail_ack_before_processing"
+			          << std::endl;
+			return 0;
+		}
+	}
+	if (m_testDropFinalAckOnce && ch.l3Prot == 0xFC &&
+		qp->m_src == m_testDropAckSrc && qp->m_dest == m_testDropAckDst &&
+		qp->sport == m_testDropAckSport && seq == qp->m_size){
+		m_testDropFinalAckOnce = false;
+		std::cout << "[RNIC TEST ACK DROP]"
+		          << " t_ns=" << Simulator::Now().GetNanoSeconds()
+		          << " node=" << m_node->GetId()
+		          << " src=" << qp->m_src << " dst=" << qp->m_dest
+		          << " sport=" << qp->sport << " ack_seq=" << seq
+		          << " snd_una=" << qp->snd_una
+		          << " highest_sent=" << qp->m_highestSentSeq
+		          << " action=discard_first_final_ack_before_processing"
+		          << std::endl;
 		return 0;
 	}
 
