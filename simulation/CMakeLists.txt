@@ -76,6 +76,7 @@ option(NS3_MONOLIB
 )
 option(NS3_MPI "Build with MPI support" OFF)
 option(NS3_MTP "Build with Multithreaded simulation support" OFF)
+option(NS3_MPQUIC "Build MPQUIC module" OFF)
 option(NS3_NATIVE_OPTIMIZATIONS "Build with -march=native -mtune=native" OFF)
 set(NS3_OUTPUT_DIRECTORY "" CACHE STRING "Directory to store built artifacts")
 option(NS3_PRECOMPILE_HEADERS
@@ -113,6 +114,10 @@ subdirlist(contrib_libs_to_build ${CMAKE_SOURCE_DIR}/contrib)
 
 # Before filtering, we need to load settings from .ns3rc
 parse_ns3rc(ns3rc_enabled_modules ns3rc_examples_enabled ns3rc_tests_enabled)
+
+if(NOT NS3_MPQUIC)
+  list(APPEND NS3_DISABLED_MODULES quic)
+endif()
 
 # After scanning modules, we can filter enabled and disabled ones
 filter_enabled_and_disabled_modules(
