@@ -48,6 +48,8 @@ public:
 
 	static TypeId GetTypeId (void);
 	SwitchNode();
+	// DCI_SPRAY_V1: dump selection telemetry for the four-link experiment.
+	static void PrintDciRoutingStats();
 	void SetEcmpSeed(uint32_t seed);
 	void AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx);
 	void ClearTable();

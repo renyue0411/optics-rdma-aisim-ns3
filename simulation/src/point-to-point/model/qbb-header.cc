@@ -44,6 +44,12 @@ namespace ns3 {
 		NS_ASSERT_MSG(IntHeader::mode == 1, "qbbHeader cannot SetTs when IntHeader::mode != 1");
 		ih.ts = ts;
 	}
+
+	void qbbHeader::SetIrnSack(uint64_t seq, uint32_t bytes){
+		flags |= 1 << FLAG_IRN;
+		m_irnSackSeq = seq;
+		m_irnSackBytes = bytes;
+	}
 	void qbbHeader::SetCnp(){
 		flags |= 1 << FLAG_CNP;
 	}
@@ -96,7 +102,7 @@ namespace ns3 {
 	}
 	uint32_t qbbHeader::GetSerializedSize(void)  const
 	{
-		return GetBaseSize() + IntHeader::GetStaticSize();
+		return GetBaseSize() + IntHeader::GetStaticSize() + ((flags & (1 << FLAG_IRN)) ? 12 : 0);
 	}
 	uint32_t qbbHeader::GetBaseSize() {
 		qbbHeader tmp;
@@ -109,7 +115,12 @@ namespace ns3 {
 		i.WriteU16(dport);
 		i.WriteU16(flags);
 		i.WriteU16(m_pg);
+
 		i.WriteU64(m_seq);
+		if (flags & (1 << FLAG_IRN)){
+			i.WriteU64(m_irnSackSeq);
+			i.WriteU32(m_irnSackBytes);
+		}
 
 		// write IntHeader
 		ih.Serialize(i);
@@ -122,7 +133,14 @@ namespace ns3 {
 		dport = i.ReadU16();
 		flags = i.ReadU16();
 		m_pg = i.ReadU16();
+
 		m_seq = i.ReadU64();
+		m_irnSackSeq = 0;
+		m_irnSackBytes = 0;
+		if (flags & (1 << FLAG_IRN)){
+			m_irnSackSeq = i.ReadU64();
+			m_irnSackBytes = i.ReadU32();
+		}
 
 		// read IntHeader
 		ih.Deserialize(i);

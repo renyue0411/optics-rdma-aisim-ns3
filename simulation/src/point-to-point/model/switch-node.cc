@@ -8,6 +8,7 @@
 #include "ns3/double.h"
 #include "ns3/abort.h"
 #include "switch-node.h"
+#include "dci-spray.h" // DCI_SPRAY_V1
 #include "qbb-net-device.h"
 #include "ppp-header.h"
 #include "ns3/int-header.h"
@@ -89,7 +90,7 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 		buf.u32[2] = ch.ack.sport | ((uint32_t)ch.ack.dport << 16);
 
 	uint32_t idx = EcmpHash(buf.u8, 12, m_ecmpSeed) % nexthops.size();
-	return nexthops[idx];
+	return DciSprayV1::Choose(this, ch, nexthops, nexthops[idx], p->GetSize());
 }
 
 void SwitchNode::CheckAndSendPfc(uint32_t inDev, uint32_t qIndex){
@@ -223,6 +224,8 @@ uint32_t SwitchNode::EcmpHash(const uint8_t* key, size_t len, uint32_t seed) {
   h ^= h >> 16;
   return h;
 }
+
+void SwitchNode::PrintDciRoutingStats(){ DciSprayV1::Print(); }
 
 void SwitchNode::SetEcmpSeed(uint32_t seed){
 	m_ecmpSeed = seed;

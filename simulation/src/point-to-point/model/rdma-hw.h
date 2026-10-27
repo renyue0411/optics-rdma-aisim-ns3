@@ -43,6 +43,17 @@ public:
 
 	Ptr<Node> m_node;
 	DataRate m_minRate;		//< Min sending rate
+
+	// IRN_PORT_V1. Mode-0 experimental transport extension, off by default.
+	bool m_irnEnabled = false;
+	uint64_t m_irnBdpBytes = 0;
+	uint64_t m_irnRtoLowNs = 0;
+	uint64_t m_irnRtoHighNs = 0;
+	void ConfigureIrn(uint64_t bdpBytes, uint64_t rtoLowNs, uint64_t rtoHighNs);
+	void ArmIrnTimeout(Ptr<RdmaQueuePair> qp);
+	void HandleIrnTimeout(Ptr<RdmaQueuePair> qp, Time scheduledRto);
+	int ReceiverCheckSeqIrn(uint64_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size);
+	void PrintIrnStats();
 	uint32_t m_mtu;
 	uint32_t m_cc_mode;
 	double m_nack_interval;
@@ -148,6 +159,13 @@ public:
     SendCompleteCallback m_sendCompleteCallback;
 	typedef Callback<void, Ptr<RdmaQueuePair> > QpProgressCallback;
 	typedef Callback<void, Ptr<RdmaQueuePair> > QpRecoverCallback;
+	// Optional progress hooks for applications that post multiple messages on
+	// one long-lived QP. TX reports the highest fresh byte sent; ACK reports
+	// the cumulative acknowledged prefix, matching legacy QP-complete timing.
+	typedef Callback<void, Ptr<RdmaQueuePair>, uint64_t> TxProgressCallback;
+	typedef Callback<void, Ptr<RdmaQueuePair>, uint64_t> AckProgressCallback;
+	TxProgressCallback m_txProgressCallback;
+	AckProgressCallback m_ackProgressCallback;
 	typedef Callback<void, Ptr<RdmaQueuePair>, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t>
 		WrCompletionCallback;
 
@@ -221,6 +239,7 @@ public:
 	void Setup(QpCompleteCallback cb,SendCompleteCallback send_cb);
 	void SetQpProgressCallback(QpProgressCallback cb);
 	void SetQpRecoverCallback(QpRecoverCallback cb);
+	void SetFlowProgressCallbacks(TxProgressCallback txCb, AckProgressCallback ackCb);
 	void SetWrCompletionCallback(WrCompletionCallback cb);
 	void GenerateWrCompletions(Ptr<RdmaQueuePair> qp);
 	void GenerateWrErrorCompletions(Ptr<RdmaQueuePair> qp);
@@ -281,6 +300,8 @@ public:
 	void BindRxQpToIngress(Ptr<RdmaRxQueuePair> qp, uint32_t nicIdx);
 	Ptr<RdmaQueuePair> CreateQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t size, uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, uint16_t _sport, uint16_t _dport, uint32_t win, uint64_t baseRtt, Callback<void> notifyAppFinish, Callback<void> notifyAppSent, uint64_t initialPostedBytes);
 	void PostWork(Ptr<RdmaQueuePair> qp, uint64_t bytes);
+	// Append bytes to a default (Mode 0) RC QP without Mode-2 WR/CQE accounting.
+	void AppendDefaultQpBytes(Ptr<RdmaQueuePair> qp, uint64_t bytes);
 	void AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t size, uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, uint16_t _sport, uint16_t _dport, uint32_t win, uint64_t baseRtt, Callback<void> notifyAppFinish, Callback<void> notifyAppSent); // add a new qp (new send)
 	void DeleteQueuePair(Ptr<RdmaQueuePair> qp);
 

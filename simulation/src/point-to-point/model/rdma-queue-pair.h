@@ -9,6 +9,9 @@
 #include <ns3/custom-header.h>
 #include <ns3/int-header.h>
 #include <vector>
+#include <list>
+#include <map>
+#include <ostream>
 
 // MODE1_CONTINUATION_ACK_RECOVERY_V1: bounded next-window DATA probing.
 // MODE1_FINAL_ACK_RECOVERY_V1: receiver-window flush plus final-tail probing.
@@ -30,8 +33,53 @@ enum RnicAckRecoveryProbeType {
 	RNIC_ACK_PROBE_TAIL = 2
 };
 
+// IRN_PORT_V1: IrnSackManager adapted from ConWeave (GPL-2.0),
+// commit 236a801a00e35de9078635e04acae2f701c21ded.
+class IrnSackManager {
+   private:
+    std::list<std::pair<uint64_t, uint64_t>> m_data;
+
+   public:
+    int socketId{-1};
+    size_t RangeCount() const { return m_data.size(); }
+    // Non-destructive cursor scan; retain SACK information until cumulative ACK.
+    uint64_t AdvancePast(uint64_t seq) const {
+        for (const auto &block : m_data) {
+            if (block.first > seq) break;
+            if (block.first + block.second > seq) seq = block.first + block.second;
+        }
+        return seq;
+    }
+
+    IrnSackManager();
+    IrnSackManager(int flow_id);
+    void sack(uint64_t seq, uint64_t size);  // put blocks
+    size_t discardUpTo(uint64_t seq);        // return number of blocks removed
+    bool IsEmpty();
+    bool blockExists(uint64_t seq, uint64_t size);  // query if block exists inside SACK table
+    bool peekFrontBlock(uint64_t *pseq, uint64_t *psize);
+    size_t getSackBufferOverhead();  // get buffer overhead
+
+    friend std::ostream &operator<<(std::ostream &os, const IrnSackManager &im);
+};
+
 class RdmaQueuePair : public Object {
 public:
+
+	// Byte-based IRN state. The source simulator also uses byte SACK blocks.
+	bool m_irnEnabled = false;
+	uint64_t m_irnBdpBytes = 0;
+	bool m_irnRecovery = false;
+	uint64_t m_irnRecoveryEnd = 0;
+	// IRN_RECOVERY_V11: IRN paper section 3.1, higher-SACK loss evidence.
+	uint64_t m_irnHighestSackEnd = 0;
+	uint64_t m_irnRetransmitNext = 0;
+	bool m_irnForceFirst = false;
+	void StartIrnRecovery();
+	IrnSackManager m_irnSack;
+	std::map<uint64_t, uint32_t> m_irnSentPackets;
+	EventId m_irnTimeoutEvent;
+	uint64_t m_irnSackFeedback = 0;
 	Time startTime;
 	Ipv4Address sip, dip;
 	uint16_t sport, dport;
@@ -213,6 +261,15 @@ public:
 
 		ECNAccount() { memset(this, 0, sizeof(ECNAccount));}
 	};
+
+	IrnSackManager m_irnSack;
+	uint64_t m_irnFeedbackSeq = 0;
+	uint32_t m_irnFeedbackSize = 0;
+	uint64_t m_irnNewBytes = 0;
+	uint64_t m_irnOooPackets = 0;
+	uint64_t m_irnDuplicatePackets = 0;
+	uint64_t m_irnWindowDrops = 0;
+	uint64_t m_irnPeakRanges = 0;
 	ECNAccount m_ecn_source;
 	uint32_t sip, dip;
 	uint16_t sport, dport;

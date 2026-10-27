@@ -24,7 +24,7 @@ class qbbHeader : public Header
 public:
  
   enum {
-	  FLAG_CNP = 0
+	  FLAG_CNP = 0, FLAG_IRN = 1
   };
   qbbHeader (uint16_t pg);
   qbbHeader ();
@@ -40,6 +40,7 @@ public:
   void SetDport(uint32_t _dport);
   void SetTs(uint64_t ts);
   void SetCnp();
+  void SetIrnSack(uint64_t seq, uint32_t bytes);
   void SetIntHeader(const IntHeader &_ih);
 
 //Getters
@@ -67,6 +68,8 @@ private:
   uint16_t flags;
   uint16_t m_pg;
   uint64_t m_seq; // the qbb sequence number.
+  uint64_t m_irnSackSeq = 0;
+  uint32_t m_irnSackBytes = 0;
   IntHeader ih;
   
 };

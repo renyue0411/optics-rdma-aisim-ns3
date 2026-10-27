@@ -95,7 +95,7 @@ uint32_t CustomHeader::GetSerializedSize (void) const{
 		else if (l3Prot == 0x11) // UDP
 			len += GetUdpHeaderSize();
 		else if (l3Prot == 0xFC || l3Prot == 0xFD)
-			len += GetAckSerializedSize();
+			len += GetAckSerializedSize() + ((ack.flags & 2) ? 12 : 0);
 		else if (l3Prot == 0xFF)
 			len += 8;
 		else if (l3Prot == 0xFE)
@@ -174,7 +174,11 @@ void CustomHeader::Serialize (Buffer::Iterator start) const{
 		  i.WriteU16(ack.flags);
 		  i.WriteU16(ack.pg);
 		  i.WriteU64(ack.seq);
-		  udp.ih.Serialize(i);
+		  if (ack.flags & 2){
+			  i.WriteU64(ack.irnSackSeq);
+			  i.WriteU32(ack.irnSackBytes);
+		  }
+		  ack.ih.Serialize(i);
 	  }else if (l3Prot == 0xFE){ // PFC
 		  i.WriteU32 (pfc.time);
 		  i.WriteU32 (pfc.qlen);
@@ -310,9 +314,15 @@ CustomHeader::Deserialize (Buffer::Iterator start)
 		  ack.flags = i.ReadU16();
 		  ack.pg = i.ReadU16();
 		  ack.seq = i.ReadU64();
+		  ack.irnSackSeq = 0;
+		  ack.irnSackBytes = 0;
+		  if (ack.flags & 2){
+			  ack.irnSackSeq = i.ReadU64();
+			  ack.irnSackBytes = i.ReadU32();
+		  }
 		  if (getInt)
 			  ack.ih.Deserialize(i);
-		  l4Size = GetAckSerializedSize();
+		  l4Size = GetAckSerializedSize() + ((ack.flags & 2) ? 12 : 0);
 	  }else if (l3Prot == 0xFE){ // PFC
 		  pfc.time = i.ReadU32 ();
 		  pfc.qlen = i.ReadU32 ();

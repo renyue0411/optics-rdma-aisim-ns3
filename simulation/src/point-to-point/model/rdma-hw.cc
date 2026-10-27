@@ -9,6 +9,7 @@
 #include "ns3/data-rate.h"
 #include "ns3/pointer.h"
 #include "rdma-hw.h"
+#include "irn-validation.h" // IRN_VALIDATION_V1
 #include "ppp-header.h"
 #include "qbb-header.h"
 #include "cn-header.h"
@@ -490,6 +491,12 @@ void RdmaHw::SetQpProgressCallback(QpProgressCallback cb){
 
 void RdmaHw::SetQpRecoverCallback(QpRecoverCallback cb){
 	m_qpRecoverCallback = cb;
+}
+
+void RdmaHw::SetFlowProgressCallbacks(TxProgressCallback txCb,
+                                      AckProgressCallback ackCb){
+	m_txProgressCallback = txCb;
+	m_ackProgressCallback = ackCb;
 }
 
 void RdmaHw::SetWrCompletionCallback(WrCompletionCallback cb){
@@ -1372,6 +1379,9 @@ Ptr<RdmaQueuePair> RdmaHw::CreateQueuePair(uint32_t src, uint32_t dest, uint64_t
 	qp->SetSize(size);
 	qp->SetInitialSize(size);
 	qp->SetPostedLimit(initialPostedBytes);
+
+	qp->m_irnEnabled = m_irnEnabled;
+	qp->m_irnBdpBytes = m_irnBdpBytes;
 	qp->SetWin(win);
 	qp->SetBaseRtt(baseRtt);
 	qp->SetVarWin(m_var_win);
@@ -1452,6 +1462,18 @@ void RdmaHw::PostWork(Ptr<RdmaQueuePair> qp, uint64_t bytes){
 	NS_ASSERT(qp->GetPostedLimit() <= qp->m_size);
 
 	uint32_t nicIdx = GetNicIdxOfQp(qp);
+	m_nic[nicIdx].dev->NewQp(qp);
+}
+
+void RdmaHw::AppendDefaultQpBytes(Ptr<RdmaQueuePair> qp, uint64_t bytes){
+	NS_ASSERT_MSG(qp != NULL && !qp->m_qpError && bytes > 0,
+	              "Mode-0 QP append requires a live QP and positive bytes");
+	NS_ASSERT_MSG(bytes <= qp->GetUnpostedBytes(),
+	              "Mode-0 QP append exceeds reserved byte space");
+	qp->AddPostedBytes(bytes);
+	NS_ASSERT(qp->snd_una <= qp->snd_nxt);
+	NS_ASSERT(qp->snd_nxt <= qp->GetPostedLimit());
+	const uint32_t nicIdx = GetNicIdxOfQp(qp);
 	m_nic[nicIdx].dev->NewQp(qp);
 }
 
@@ -1574,6 +1596,9 @@ void RdmaHw::SendRxControlPacket(Ptr<RdmaRxQueuePair> rxQp,
 	seqh.SetSport(rxQp->sport);
 	seqh.SetDport(rxQp->dport);
 	seqh.SetIntHeader(rxQp->m_lastAckIntHeader);
+	if (m_irnEnabled){
+		seqh.SetIrnSack(rxQp->m_irnFeedbackSeq, rxQp->m_irnFeedbackSize);
+	}
 	if (rxQp->m_ackCnpPending){
 		seqh.SetCnp();
 	}
@@ -1697,6 +1722,7 @@ void RdmaHw::FlushRnicPortAcks(
 }
 
 int RdmaHw::ReceiveUdp(Ptr<QbbNetDevice> ingressDev, Ptr<Packet> p, CustomHeader &ch){
+	if (IrnValidationV1::Inject(this, ingressDev, p, ch)) return 0;
 	uint8_t ecnbits = ch.GetIpv4EcnBits();
 
 	uint32_t payload_size = p->GetSize() - ch.GetSerializedSize();
@@ -1718,18 +1744,22 @@ int RdmaHw::ReceiveUdp(Ptr<QbbNetDevice> ingressDev, Ptr<Packet> p, CustomHeader
 	}
 	rxQp->m_ecn_source.total++;
 
-	int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
+	int x = m_irnEnabled
+		? ReceiverCheckSeqIrn(ch.udp.seq, rxQp, payload_size)
+		: ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
 	const uint64_t acceptedBytes =
 			rxQp->ReceiverNextExpectedSeq > oldExpected
 					? rxQp->ReceiverNextExpectedSeq - oldExpected
 					: 0;
 
-	if (acceptedBytes != 0){
-			g_deliveredUsefulBytes += acceptedBytes;
+	const uint64_t newUsefulBytes = m_irnEnabled ? rxQp->m_irnNewBytes : acceptedBytes;
+	IrnValidationV1::ObserveRx(ch, rxQp, oldExpected, newUsefulBytes);
+	if (newUsefulBytes != 0){
+			g_deliveredUsefulBytes += newUsefulBytes;
 
 			// IPv4 ECN CE codepoint = 0b11.
 			if (ecnbits == 0x03){
-					g_ceMarkedDeliveredUsefulBytes += acceptedBytes;
+					g_ceMarkedDeliveredUsefulBytes += newUsefulBytes;
 			}
 
 			rxQp->m_ackDirty = true;
@@ -1741,7 +1771,7 @@ int RdmaHw::ReceiveUdp(Ptr<QbbNetDevice> ingressDev, Ptr<Packet> p, CustomHeader
 			                  ch.udp.sport,
 			                  ch.udp.dport,
 			                  ch.udp.pg,
-			                  static_cast<uint32_t>(acceptedBytes));
+			                  static_cast<uint32_t>(newUsefulBytes));
 		}
 	}
 
@@ -1858,7 +1888,44 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 	uint32_t nic_idx = GetNicIdxOfQp(qp);
 	Ptr<QbbNetDevice> dev = m_nic[nic_idx].dev;
 	bool rcAckProgress = false;
-	if (m_ack_interval == 0)
+	if (qp->m_irnEnabled){
+		NS_ABORT_MSG_IF(!(ch.ack.flags & 2), "IRN sender received legacy feedback");
+		NS_ABORT_MSG_IF(seq > qp->m_highestSentSeq, "IRN cumulative ACK exceeds sent data");
+		const uint64_t oldUna = qp->snd_una;
+		qp->Acknowledge(seq);
+		qp->m_irnSack.discardUpTo(qp->snd_una);
+		if (ch.ack.irnSackBytes != 0){
+			const uint64_t s = ch.ack.irnSackSeq;
+			const uint64_t len = ch.ack.irnSackBytes;
+			NS_ABORT_MSG_IF(s > qp->m_highestSentSeq || len > qp->m_highestSentSeq - s,
+			                "IRN selective ACK exceeds sent data");
+			if (s + len > qp->snd_una){
+				qp->m_irnSack.sack(s, len);
+				qp->m_irnHighestSackEnd = std::max(qp->m_irnHighestSackEnd, s + len);
+				qp->m_irnSackFeedback++;
+			}
+		}
+		while (!qp->m_irnSentPackets.empty() &&
+		       qp->m_irnSentPackets.begin()->first + qp->m_irnSentPackets.begin()->second <= qp->snd_una){
+			qp->m_irnSentPackets.erase(qp->m_irnSentPackets.begin());
+		}
+		if (qp->m_irnRecovery && qp->snd_una >= qp->m_irnRecoveryEnd){
+			qp->m_irnRecovery = false;
+		}
+		// Equivalent to ConWeave's nonzero irnNackSize recovery hint.
+		if (ch.ack.irnSackBytes && ch.ack.irnSackSeq >= qp->snd_una && !qp->m_irnRecovery){
+			qp->StartIrnRecovery();
+			qp->m_nackCount++;
+			RecoverQueue(qp);
+		}
+		IrnValidationV1::ObserveAck(qp, ch);
+		GenerateWrCompletions(qp);
+		if (qp->snd_una > oldUna && !m_ackProgressCallback.IsNull()){
+			m_ackProgressCallback(qp, qp->snd_una);
+		}
+		if (qp->IsFinished()) QpComplete(qp);
+		else ArmIrnTimeout(qp);
+	}else if (m_ack_interval == 0)
 		std::cout << "ERROR: shouldn't receive ack\n";
 	else {
 		const uint64_t effectiveAckSeq =
@@ -1880,12 +1947,15 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 				}
 			}
 			GenerateWrCompletions(qp);
+			if (rcAckProgress && !m_ackProgressCallback.IsNull()){
+				m_ackProgressCallback(qp, qp->snd_una);
+			}
 		}
 		if (qp->IsFinished()){
 			QpComplete(qp);
 		}
 	}
-	if (ch.l3Prot == 0xFD) // NACK
+	if (!qp->m_irnEnabled && ch.l3Prot == 0xFD) // legacy NACK
 	{
 		qp->m_nackCount++;
 		RecoverQueue(qp);
@@ -1943,6 +2013,121 @@ int RdmaHw::Receive(Ptr<QbbNetDevice> ingressDev, Ptr<Packet> p, CustomHeader &c
 		ReceiveAck(p, ch);
 	}
 	return 0;
+}
+
+
+// IRN_PORT_V1: adapted from conweave-project/conweave-ns3, commit
+// 236a801a00e35de9078635e04acae2f701c21ded, under GPL-2.0.
+// See the accompanying provenance note for intentional integration differences.
+void RdmaHw::ConfigureIrn(uint64_t bdp, uint64_t low, uint64_t high){
+	NS_ABORT_MSG_IF(bdp < m_mtu || low == 0 || high < low,
+	                "IRN requires BDP >= MTU and 0 < RTO_low <= RTO_high");
+	NS_ABORT_MSG_IF(!m_qpMap.empty(), "IRN must be configured before QPs are created");
+	NS_ABORT_MSG_IF(IsRcAckRetryEnabled() || m_rnicDeadlineEnabled || m_rnicAckRecoveryEnabled,
+	                "IRN cannot share a QP with legacy RC/OCS recovery timers");
+	NS_ABORT_MSG_IF(m_backto0, "IRN requires L2_BACK_TO_ZERO=0");
+	m_irnEnabled = true;
+	m_irnBdpBytes = bdp;
+	m_irnRtoLowNs = low;
+	m_irnRtoHighNs = high;
+}
+
+int RdmaHw::ReceiverCheckSeqIrn(uint64_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size){
+	NS_ABORT_MSG_IF(size == 0 || seq > std::numeric_limits<uint64_t>::max() - size,
+	                "Invalid IRN DATA range");
+	const uint64_t old = q->ReceiverNextExpectedSeq;
+	const uint64_t end = seq + size;
+	q->m_irnNewBytes = 0;
+	q->m_irnFeedbackSeq = 0;
+	q->m_irnFeedbackSize = 0;
+	if (end <= old){
+		q->m_irnDuplicatePackets++;
+		return 1; // duplicate DATA elicits a cumulative ACK (tail loss recovery)
+	}
+	// Bound tracked sequence span by BDP-FC, using subtraction to avoid overflow.
+	if (end - old > m_irnBdpBytes){
+		q->m_irnWindowDrops++;
+		return 1; // never selectively acknowledge discarded data
+	}
+	const uint64_t start = std::max<uint64_t>(seq, old);
+	// The reference manager stores disjoint, merged intervals. Its byte count
+	// before/after insertion yields unique data without storing payloads.
+	const uint64_t before = q->m_irnSack.getSackBufferOverhead();
+	q->m_irnSack.sack(start, static_cast<uint64_t>(end - start));
+	q->m_irnNewBytes = q->m_irnSack.getSackBufferOverhead() - before;
+	q->m_irnPeakRanges = std::max<uint64_t>(q->m_irnPeakRanges, q->m_irnSack.RangeCount());
+	uint64_t first, bytes;
+	while (q->m_irnSack.peekFrontBlock(&first, &bytes) && first <= q->ReceiverNextExpectedSeq){
+		q->ReceiverNextExpectedSeq = std::max<uint64_t>(q->ReceiverNextExpectedSeq, first + bytes);
+		q->m_irnSack.discardUpTo(q->ReceiverNextExpectedSeq);
+	}
+	if (seq > old){
+		q->m_irnOooPackets++;
+		q->m_irnFeedbackSeq = seq;
+		q->m_irnFeedbackSize = size;
+		return 2; // cumulative ACK plus triggering DATA range, i.e. simplified SACK
+	}
+	// As in the source simulator, fresh progress is acknowledged even at an
+	// appended short-message tail: no dependence on MTU-aligned message sizes.
+	return 1;
+}
+
+void RdmaHw::ArmIrnTimeout(Ptr<RdmaQueuePair> qp){
+	if (!qp->m_irnTimeoutEvent.IsExpired()) Simulator::Cancel(qp->m_irnTimeoutEvent);
+	if (!qp->m_irnEnabled || qp->m_qpError || qp->snd_una >= qp->m_highestSentSeq) return;
+	const uint64_t flight = qp->m_highestSentSeq - qp->snd_una;
+	const Time rto = NanoSeconds(flight > 3ULL * m_mtu ? m_irnRtoHighNs : m_irnRtoLowNs);
+	qp->m_irnTimeoutEvent = Simulator::Schedule(rto, &RdmaHw::HandleIrnTimeout, this, qp, rto);
+}
+
+void RdmaHw::HandleIrnTimeout(Ptr<RdmaQueuePair> qp, Time scheduledRto){
+	qp->m_irnTimeoutEvent = EventId();
+	const auto it = m_qpMap.find(GetQpKey(qp->dip.Get(), qp->sport, qp->m_pg));
+	if (it == m_qpMap.end() || it->second != qp || qp->m_qpError ||
+	    qp->snd_una >= qp->m_highestSentSeq) return;
+	// Re-evaluate the short-RTO condition, matching IRN's timeout module.
+	if (m_irnRtoLowNs < m_irnRtoHighNs &&
+	    scheduledRto == NanoSeconds(m_irnRtoLowNs) &&
+	    qp->m_highestSentSeq - qp->snd_una > 3ULL * m_mtu){
+		qp->m_irnTimeoutEvent = Simulator::Schedule(
+			NanoSeconds(m_irnRtoHighNs - m_irnRtoLowNs),
+			&RdmaHw::HandleIrnTimeout, this, qp, NanoSeconds(m_irnRtoHighNs));
+		return;
+	}
+	qp->m_timeoutCount++;
+	qp->StartIrnRecovery();
+	RecoverQueue(qp);
+	const uint32_t idx = GetNicIdxOfQp(qp);
+	m_nic[idx].dev->TriggerTransmit();
+	ArmIrnTimeout(qp);
+}
+
+void RdmaHw::PrintIrnStats(){
+	if (!m_irnEnabled) return;
+	IrnValidationV1::Report(this);
+	uint64_t retx = 0, timeouts = 0, sacks = 0, outstanding = 0;
+	uint64_t ooo = 0, dup = 0, drops = 0, peak = 0;
+	for (const auto &p : m_qpMap){
+		retx += p.second->m_retransBytes;
+		timeouts += p.second->m_timeoutCount;
+		sacks += p.second->m_irnSackFeedback;
+		outstanding += p.second->m_highestSentSeq - p.second->snd_una;
+	}
+	for (const auto &p : m_rxQpMap){
+		ooo += p.second->m_irnOooPackets;
+		dup += p.second->m_irnDuplicatePackets;
+		drops += p.second->m_irnWindowDrops;
+		peak = std::max<uint64_t>(peak, p.second->m_irnPeakRanges);
+	}
+	std::cout << "IRN_STATS node=" << m_node->GetId()
+	          << " recovery_version=11"
+	          << " live_qps=" << m_qpMap.size()
+	          << " live_qp_retrans_bytes=" << retx
+	          << " live_qp_timeouts=" << timeouts
+	          << " live_qp_sack_feedback=" << sacks
+	          << " outstanding_bytes=" << outstanding
+	          << " rx_ooo_packets=" << ooo << " rx_duplicate_packets=" << dup
+	          << " rx_window_drops=" << drops << " rx_peak_ranges=" << peak << std::endl;
 }
 
 int RdmaHw::ReceiverCheckSeq(uint64_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size){
@@ -2137,6 +2322,7 @@ void RdmaHw::QpError(Ptr<RdmaQueuePair> qp, uint32_t status){
 }
 
 void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
+	if (!qp->m_irnTimeoutEvent.IsExpired()) Simulator::Cancel(qp->m_irnTimeoutEvent);
 	NS_ASSERT(!m_qpCompleteCallback.IsNull());
 	CancelRcAckTimeout(qp);
 	TraceQpState(qp);
@@ -2211,10 +2397,29 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 		payload_size = std::min<uint64_t>(
 			m_mtu, qp->m_highestSentSeq - packetSeq);
 	}else{
+		// GetBytesLeft can select a SACK-driven retransmission cursor.
+		const uint64_t bytesLeft = qp->GetBytesLeft();
 		packetSeq = qp->snd_nxt;
-		payload_size = std::min<uint64_t>(m_mtu, qp->GetBytesLeft());
+		payload_size = std::min<uint64_t>(m_mtu, bytesLeft);
+	}
+	if (qp->m_irnEnabled){
+		if (packetSeq < qp->m_highestSentSeq){
+			NS_ABORT_MSG_IF(!qp->m_irnRecovery ||
+			                (!qp->m_irnForceFirst && packetSeq >= qp->m_irnHighestSackEnd),
+			                "IRN retransmission lacks higher-sequence SACK evidence");
+			const auto packet = qp->m_irnSentPackets.find(packetSeq);
+			NS_ABORT_MSG_IF(packet == qp->m_irnSentPackets.end(),
+			                "IRN retransmission is not at an original packet boundary");
+			payload_size = packet->second;
+		}else{
+			const uint64_t flight = qp->m_highestSentSeq - qp->snd_una;
+			NS_ABORT_MSG_IF(flight >= qp->m_irnBdpBytes, "IRN BDP cap bypassed");
+			payload_size = std::min<uint64_t>(payload_size, qp->m_irnBdpBytes - flight);
+			qp->m_irnSentPackets.emplace(packetSeq, static_cast<uint32_t>(payload_size));
+		}
 	}
 	NS_ASSERT_MSG(payload_size > 0, "RDMA DATA packet must carry payload");
+	IrnValidationV1::ObserveTx(qp, packetSeq, payload_size);
 
 	Ptr<Packet> p = Create<Packet>((uint32_t)payload_size);
 	SimpleSeqTsHeader seqTs;
@@ -2298,6 +2503,10 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	}
 
 	if (packetSeq < qp->m_highestSentSeq){
+		if (qp->m_irnEnabled){
+			qp->m_irnRetransmitNext = packetSeq + payload_size;
+			qp->m_irnForceFirst = false;
+		}
 		qp->m_retransPackets++;
 		qp->m_retransBytes += std::min<uint64_t>(
 			payload_size, qp->m_highestSentSeq - packetSeq);
@@ -2314,6 +2523,9 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 
 void RdmaHw::PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap){
 	qp->lastPktSize = pkt->GetSize();
+	if (!m_txProgressCallback.IsNull()){
+		m_txProgressCallback(qp, qp->m_highestSentSeq);
+	}
 
 	if (m_rnicDeadlineEnabled &&
 		!qp->m_deadlineSampleOutstanding &&
@@ -2335,6 +2547,7 @@ void RdmaHw::PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap)
 		ArmRcAckTimeout(qp, false);
 	}
 
+	if (qp->m_irnEnabled && qp->m_irnTimeoutEvent.IsExpired()) ArmIrnTimeout(qp);
 	UpdateNextAvail(qp, interframeGap, pkt->GetSize());
 }
 
