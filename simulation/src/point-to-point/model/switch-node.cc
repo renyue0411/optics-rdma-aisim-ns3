@@ -9,6 +9,7 @@
 #include "ns3/abort.h"
 #include "switch-node.h"
 #include "dci-spray.h" // DCI_SPRAY_V1
+#include "irn-diagnostics.h"
 #include "qbb-net-device.h"
 #include "ppp-header.h"
 #include "ns3/int-header.h"
@@ -111,6 +112,7 @@ void SwitchNode::CheckAndSendResume(uint32_t inDev, uint32_t qIndex){
 void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 	int idx = GetOutDev(p, ch);
 	if (idx < 0){
+		IrnDiagnosticsV1::Drop(p, GetId(), "no_route");
 		return; // Drop
 	}
 
@@ -168,6 +170,7 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 			m_mmu->UpdateIngressAdmission(inDev, qIndex, p->GetSize());
 			m_mmu->UpdateEgressAdmission(idx, qIndex, p->GetSize());
 		}else{
+			IrnDiagnosticsV1::Drop(p, GetId(), "switch_mmu_admission");
 			return; // Drop
 		}
 		CheckAndSendPfc(inDev, qIndex);
@@ -226,6 +229,10 @@ uint32_t SwitchNode::EcmpHash(const uint8_t* key, size_t len, uint32_t seed) {
 }
 
 void SwitchNode::PrintDciRoutingStats(){ DciSprayV1::Print(); }
+
+void SwitchNode::ConfigureDciRouting(const std::string &mode, const std::string &nodes){
+  DciSprayV1::Configure(mode, nodes);
+}
 
 void SwitchNode::SetEcmpSeed(uint32_t seed){
 	m_ecmpSeed = seed;

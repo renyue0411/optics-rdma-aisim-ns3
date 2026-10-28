@@ -1,3 +1,4 @@
+#include "irn-diagnostics.h"
 /* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
 /*
 * Copyright (c) 2006 Georgia Tech Research Corporation, INRIA
@@ -668,6 +669,7 @@ namespace ns3 {
 	{
 		NS_LOG_FUNCTION(this << packet);
 		if (!m_linkUp){
+			IrnDiagnosticsV1::Drop(packet, m_node->GetId(), "qbb_drop");
 			m_traceDrop(packet, 0);
 			return;
 		}
@@ -678,6 +680,7 @@ namespace ns3 {
 			// If we have an error model and it indicates that it is time to lose a
 			// corrupted packet, don't forward this packet up, let it go.
 			//
+			IrnDiagnosticsV1::Drop(packet, m_node->GetId(), "receive_error");
 			m_phyRxDropTrace(packet);
 			return;
 		}
@@ -710,7 +713,8 @@ namespace ns3 {
 			// than create RDMA RX state and generate ACK/NACK feedback.
 			if (m_node->GetNodeType() == 0 &&
 			    did != m_node->GetId()){
-				m_traceDrop(packet, 0);
+				IrnDiagnosticsV1::Drop(packet, m_node->GetId(), "qbb_drop");
+			m_traceDrop(packet, 0);
 				return;
 			}
 
@@ -860,6 +864,7 @@ namespace ns3 {
 		Simulator::Schedule(txCompleteTime, &QbbNetDevice::TransmitComplete, this);
 
 		bool result = m_channel->TransmitStart(p, this, txTime);
+		IrnDiagnosticsV1::LinkTx(p, m_node->GetId(), m_ifIndex, result);
 
 		if (result == false)
 		{
@@ -908,6 +913,7 @@ namespace ns3 {
 		Simulator::Schedule(txCompleteTime, &QbbNetDevice::SwitchAsHostTransmitComplete, this);
 
 		bool result = m_channel->TransmitStart(p, this, txTime);
+		IrnDiagnosticsV1::LinkTx(p, m_node->GetId(), m_ifIndex, result);
 
 		if (result == false)
 		{

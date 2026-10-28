@@ -2,6 +2,7 @@
 #define SWITCH_NODE_H
 
 #include <unordered_map>
+#include <string>
 #include <ns3/node.h>
 #include "qbb-net-device.h"
 #include "switch-mmu.h"
@@ -48,8 +49,9 @@ public:
 
 	static TypeId GetTypeId (void);
 	SwitchNode();
-	// DCI_SPRAY_V1: dump selection telemetry for the four-link experiment.
+	// Configure DATA-only DCI routing and dump candidate-port telemetry.
 	static void PrintDciRoutingStats();
+	static void ConfigureDciRouting(const std::string &mode, const std::string &nodes);
 	void SetEcmpSeed(uint32_t seed);
 	void AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx);
 	void ClearTable();

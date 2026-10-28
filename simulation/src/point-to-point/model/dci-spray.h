@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// DCI_SPRAY_V1: DATA-only round-robin over the four direct 6<->7 WAN links.
+// DATA-only DCI routing over the destination routing table candidate ports.
 #ifndef SIMAI_DCI_SPRAY_V1_H
 #define SIMAI_DCI_SPRAY_V1_H
 #include "switch-node.h"
 #include "ns3/abort.h"
 #include "ns3/channel.h"
 #include "ns3/simulator.h"
+#include "ns3/random-variable-stream.h"
+#include "ns3/rng-seed-manager.h"
+#include <limits>
+#include <sstream>
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
@@ -20,8 +24,8 @@ namespace DciSprayV1 {
 using Flow = std::tuple<uint32_t, uint32_t, uint16_t, uint16_t, uint16_t>;
 struct PortStats { uint64_t packets = 0; uint64_t bytes = 0; };
 struct Router {
-  bool configured = false;
-  std::set<uint32_t> checkedDestinations;
+  std::set<std::vector<int>> checkedPorts;
+  Ptr<UniformRandomVariable> random;
   std::map<Flow, uint64_t> next;
   std::map<int, PortStats> ports;
   std::map<Flow, std::set<int>> flowPorts;
@@ -30,60 +34,88 @@ struct State {
   std::string mode = "ecmp";
   bool enabled = false;
   bool printed = false;
+  std::set<uint32_t> nodes{6, 7};
   std::map<uint32_t, Router> routers;
   State() {
     enabled = std::getenv("SIMAI_DCI_ROUTING") != nullptr ||
               std::getenv("SIMAI_DCI_EXPERIMENT_MS") != nullptr;
     if (const char *value = std::getenv("SIMAI_DCI_ROUTING")) mode = value;
-    NS_ABORT_MSG_IF(mode != "ecmp" && mode != "spray_rr",
-                    "SIMAI_DCI_ROUTING must be ecmp or spray_rr");
+    NS_ABORT_MSG_IF(mode != "ecmp" && mode != "spray_rr" && mode != "spray_random",
+                    "SIMAI_DCI_ROUTING must be ecmp, spray_rr or spray_random");
   }
 };
 inline State &Get() { static State state; return state; }
 
+// Config-file settings override the legacy environment mode. With no config
+// keys the old SIMAI_DCI_ROUTING / SIMAI_DCI_EXPERIMENT_MS behavior is retained.
+inline void Configure(const std::string &mode, const std::string &nodes) {
+  State &state = Get();
+  NS_ABORT_MSG_IF(!state.routers.empty(), "Configure DCI routing before traffic starts");
+  NS_ABORT_MSG_IF(mode != "ecmp" && mode != "spray_rr" && mode != "spray_random",
+                  "DCI_ROUTING_MODE must be ecmp, spray_rr or spray_random");
+  std::set<uint32_t> selected;
+  std::istringstream input(nodes);
+  std::string token;
+  NS_ABORT_MSG_IF(nodes.empty() || nodes.back() == ',', "Invalid DCI_ROUTING_NODES");
+  while (std::getline(input, token, ',')) {
+    NS_ABORT_MSG_IF(token.empty() || token.find_first_not_of("0123456789") != std::string::npos,
+                    "DCI_ROUTING_NODES must be comma-separated distinct node IDs");
+    uint64_t value = 0;
+    for (char c : token) {
+      value = value * 10 + (c - '0');
+      NS_ABORT_MSG_IF(value > std::numeric_limits<uint32_t>::max(), "DCI node ID overflow");
+    }
+    NS_ABORT_MSG_IF(!selected.insert(static_cast<uint32_t>(value)).second,
+                    "Duplicate DCI_ROUTING_NODES entry");
+  }
+  state.mode = mode;
+  state.nodes = selected;
+  state.enabled = true;
+}
+
 inline int Choose(SwitchNode *node, const CustomHeader &ch,
                   const std::vector<int> &hops, int ecmpPort, uint32_t bytes) {
-  const uint32_t id = node->GetId();
-  if ((id != 6 && id != 7) || ch.l3Prot != 0x11 || hops.size() <= 1)
-    return ecmpPort;
+  // ACK/NACK/CNP always retain the caller's existing ECMP selection.
+  if (ch.l3Prot != 0x11) return ecmpPort;
   State &state = Get();
-  if (!state.enabled) return ecmpPort;
+  const uint32_t id = node->GetId();
+  if (!state.enabled || state.nodes.count(id) == 0) return ecmpPort;
+  NS_ABORT_MSG_IF(hops.empty(), "DCI routing requires a nonempty candidate list");
   Router &router = state.routers[id];
-  if (router.checkedDestinations.insert(ch.dip).second) {
-    std::vector<int> sorted(hops);
-    std::sort(sorted.begin(), sorted.end());
-    const std::vector<int> expected{3, 4, 5, 6};
-    NS_ABORT_MSG_IF(sorted != expected,
-                    "DCI spray benchmark requires four distinct WAN ports 3,4,5,6");
-    const uint32_t peer = id == 6 ? 7 : 6;
-    for (int port : sorted) {
-      NS_ABORT_MSG_IF(static_cast<uint32_t>(port) >= node->GetNDevices(), "Invalid WAN interface");
+  if (router.checkedPorts.insert(hops).second) {
+    std::set<int> unique;
+    for (int port : hops) {
+      NS_ABORT_MSG_IF(port < 0 || static_cast<uint32_t>(port) >= node->GetNDevices(),
+                      "Invalid DCI candidate interface");
+      NS_ABORT_MSG_IF(!unique.insert(port).second, "Duplicate DCI candidate interface");
       Ptr<Channel> channel = node->GetDevice(port)->GetChannel();
       NS_ABORT_MSG_IF(channel == nullptr || channel->GetNDevices() != 2,
-                      "WAN interface must be a point-to-point channel");
-      bool foundPeer = false;
-      for (std::size_t i = 0; i < channel->GetNDevices(); ++i) {
-        if (channel->GetDevice(i)->GetNode()->GetId() == peer) foundPeer = true;
-      }
-      NS_ABORT_MSG_IF(!foundPeer, "WAN interface does not connect routers 6 and 7");
+                      "DCI candidate must be a point-to-point interface");
+      router.ports[port];
     }
+    std::cout << "DCI_ROUTING_CONFIG node=" << id << " mode=" << state.mode << " ports=";
+    for (size_t i = 0; i < hops.size(); ++i) std::cout << (i ? "," : "") << hops[i];
+    std::cout << " candidate_count=" << hops.size()
+              << " data_only=1 control=ecmp rr_scope=qp initial_phase=ecmp"
+              << " rng_stream=" << (1700000LL + id)
+              << " rng_seed=" << RngSeedManager::GetSeed()
+              << " rng_run=" << RngSeedManager::GetRun() << std::endl;
   }
-  if (!router.configured) {
-    router.configured = true;
-    for (int port = 3; port <= 6; ++port) router.ports[port];
-    std::cout << "DCI_ROUTING_CONFIG node=" << id << " mode=" << state.mode
-              << " peer=" << (id == 6 ? 7 : 6)
-              << " ports=3,4,5,6 data_only=1 control=ecmp rr_scope=qp initial_phase=ecmp"
-              << std::endl;
-  }
+  const auto initial = std::find(hops.begin(), hops.end(), ecmpPort);
+  NS_ABORT_MSG_IF(initial == hops.end(), "ECMP port is not a DCI candidate");
   const Flow flow(ch.sip, ch.dip, ch.udp.sport, ch.udp.dport, ch.udp.pg);
   int selected = ecmpPort;
-  if (state.mode == "spray_rr") {
-    // Each QP cycles independently. A shared destination counter could alias
-    // with an equally sized round-robin QP schedule and keep each QP on one
-    // port. ECMP only seeds the initial phase; every following packet rotates.
-    auto counter = router.next.emplace(flow, static_cast<uint64_t>(ecmpPort - 3));
-    selected = 3 + static_cast<int>(counter.first->second++ % 4);
+  if (hops.size() > 1 && state.mode == "spray_rr") {
+    auto counter = router.next.emplace(flow, static_cast<uint64_t>(initial - hops.begin()));
+    selected = hops[counter.first->second % hops.size()];
+    counter.first->second = (counter.first->second % hops.size() + 1) % hops.size();
+  } else if (hops.size() > 1 && state.mode == "spray_random") {
+    if (router.random == nullptr) {
+      router.random = CreateObject<UniformRandomVariable>();
+      // Stable per-router stream, independent of object creation order.
+      router.random->SetStream(1700000LL + id);
+    }
+    selected = hops[router.random->GetInteger(0, static_cast<uint32_t>(hops.size() - 1))];
   }
   router.ports[selected].packets++;
   router.ports[selected].bytes += bytes;
