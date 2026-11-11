@@ -34,7 +34,21 @@ namespace ns3 {
 		memset(egress_bytes, 0, sizeof(egress_bytes));
 	}
 	bool SwitchMmu::CheckIngressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize){
+		// DCI_WAN_POOL_V1: global hard capacity, plus reserved-space protection on WAN ingress.
+		if (m_dciWanPool){
+			if (m_dciDataUsed > buffer_size || psize > uint64_t(buffer_size) - m_dciDataUsed){
+				++m_dciAdmissionDrops; return false;
+			}
+			if (m_dciWanPort[port]){
+				const uint64_t capacity = DciSharedCapacity();
+				if (shared_used_bytes > capacity || psize > capacity - shared_used_bytes){
+					++m_dciAdmissionDrops; return false;
+				}
+				return true; // no PFC dynamic per-ingress threshold on a lossy WAN port
+			}
+		}
 		if (psize + hdrm_bytes[port][qIndex] > headroom[port] && psize + GetSharedUsed(port, qIndex) > GetPfcThreshold(port)){
+			if (m_dciWanPool) ++m_dciAdmissionDrops;
 			// printf("%lu %u Drop: queue:%u,%u: Headroom full\n", Simulator::Now().GetTimeStep(), node_id, port, qIndex);
 			// for (uint32_t i = 1; i < 64; i++)
 			// 	printf("(%u,%u)", hdrm_bytes[i][3], ingress_bytes[i][3]);
@@ -47,6 +61,17 @@ namespace ns3 {
 		return true;
 	}
 	void SwitchMmu::UpdateIngressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize){
+		if (m_dciWanPool){
+			m_dciDataUsed += psize;
+			NS_ABORT_MSG_IF(m_dciDataUsed > buffer_size, "Gateway DATA pool overflow");
+			m_dciDataPeak = std::max(m_dciDataPeak, m_dciDataUsed);
+			if (m_dciWanPort[port]){
+				ingress_bytes[port][qIndex] += psize;
+				shared_used_bytes += psize;
+				NS_ABORT_MSG_IF(shared_used_bytes > DciSharedCapacity(), "WAN shared pool overflow");
+				return;
+			}
+		}
 		uint32_t new_bytes = ingress_bytes[port][qIndex] + psize;
 		if (new_bytes <= reserve){
 			ingress_bytes[port][qIndex] += psize;
@@ -64,6 +89,17 @@ namespace ns3 {
 		egress_bytes[port][qIndex] += psize;
 	}
 	void SwitchMmu::RemoveFromIngressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize){
+		if (m_dciWanPool){
+			NS_ABORT_MSG_IF(psize > m_dciDataUsed, "Gateway DATA accounting underflow");
+			m_dciDataUsed -= psize;
+			if (m_dciWanPort[port]){
+				NS_ABORT_MSG_IF(psize > ingress_bytes[port][qIndex] || psize > shared_used_bytes,
+				                "WAN shared accounting underflow");
+				ingress_bytes[port][qIndex] -= psize;
+				shared_used_bytes -= psize;
+				return;
+			}
+		}
 		uint32_t from_hdrm = std::min(hdrm_bytes[port][qIndex], psize);
 		uint32_t from_shared = std::min(psize - from_hdrm, ingress_bytes[port][qIndex] > reserve ? ingress_bytes[port][qIndex] - reserve : 0);
 		hdrm_bytes[port][qIndex] -= from_hdrm;
@@ -74,9 +110,11 @@ namespace ns3 {
 		egress_bytes[port][qIndex] -= psize;
 	}
 	bool SwitchMmu::CheckShouldPause(uint32_t port, uint32_t qIndex){
+		if (m_dciWanPool && m_dciWanPort[port]) return false;
 		return !paused[port][qIndex] && (hdrm_bytes[port][qIndex] > 0 || GetSharedUsed(port, qIndex) >= GetPfcThreshold(port));
 	}
 	bool SwitchMmu::CheckShouldResume(uint32_t port, uint32_t qIndex){
+		if (m_dciWanPool && m_dciWanPort[port]) return false;
 		if (!paused[port][qIndex])
 			return false;
 		uint32_t shared_used = GetSharedUsed(port, qIndex);
@@ -90,9 +128,14 @@ namespace ns3 {
 	}
 
 	uint32_t SwitchMmu::GetPfcThreshold(uint32_t port){
+		if (m_dciWanPool){
+			const uint64_t capacity = DciSharedCapacity();
+			return (capacity > shared_used_bytes ? capacity - shared_used_bytes : 0) >> pfc_a_shift[port];
+		}
 		return (buffer_size - total_hdrm - total_rsrv - shared_used_bytes) >> pfc_a_shift[port];
 	}
 	uint32_t SwitchMmu::GetSharedUsed(uint32_t port, uint32_t qIndex){
+		if (m_dciWanPool && m_dciWanPort[port]) return ingress_bytes[port][qIndex];
 		uint32_t used = ingress_bytes[port][qIndex];
 		return used > reserve ? used - reserve : 0;
 	}
@@ -121,7 +164,7 @@ namespace ns3 {
 		total_rsrv = 0;
 		for (uint32_t i = 1; i <= n_port; i++){
 			total_hdrm += headroom[i];
-			total_rsrv += reserve;
+			if (!m_dciWanPool || !m_dciWanPort[i]) total_rsrv += reserve;
 		}
 	}
 	void SwitchMmu::ConfigBufferSize(uint32_t size){

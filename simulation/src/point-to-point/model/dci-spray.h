@@ -36,23 +36,46 @@ struct State {
   bool printed = false;
   std::set<uint32_t> nodes{6, 7};
   std::map<uint32_t, Router> routers;
+  uint32_t ecmpSeed = 0;
   State() {
+    if (const char *raw = std::getenv("SIMAI_DCI_ECMP_SEED")) {
+      const std::string token(raw);
+      NS_ABORT_MSG_IF(token.empty() ||
+                      token.find_first_not_of("0123456789") != std::string::npos,
+                      "SIMAI_DCI_ECMP_SEED must be a uint32");
+      uint64_t value = 0;
+      for (char c : token) {
+        value = value * 10 + (c - '0');
+        NS_ABORT_MSG_IF(value > std::numeric_limits<uint32_t>::max(),
+                        "ECMP seed overflow");
+      }
+      ecmpSeed = static_cast<uint32_t>(value);
+    }
     enabled = std::getenv("SIMAI_DCI_ROUTING") != nullptr ||
               std::getenv("SIMAI_DCI_EXPERIMENT_MS") != nullptr;
     if (const char *value = std::getenv("SIMAI_DCI_ROUTING")) mode = value;
-    NS_ABORT_MSG_IF(mode != "ecmp" && mode != "spray_rr" && mode != "spray_random",
-                    "SIMAI_DCI_ROUTING must be ecmp, spray_rr or spray_random");
+    NS_ABORT_MSG_IF(mode != "ecmp" && mode != "spray_rr" && mode != "spray_random" && mode != "qp_fixed",
+                    "SIMAI_DCI_ROUTING must be ecmp, qp_fixed, spray_rr or spray_random");
   }
 };
 inline State &Get() { static State state; return state; }
+
+// Zero preserves the baseline. Only DCI multipath DATA hashing is changed.
+inline uint32_t EcmpSeed(SwitchNode *node, const CustomHeader &ch,
+                         uint32_t base, size_t candidates) {
+  State &state = Get();
+  if (ch.l3Prot == 0x11 && candidates > 1 && state.enabled &&
+      state.nodes.count(node->GetId()) != 0) return base ^ state.ecmpSeed;
+  return base;
+}
 
 // Config-file settings override the legacy environment mode. With no config
 // keys the old SIMAI_DCI_ROUTING / SIMAI_DCI_EXPERIMENT_MS behavior is retained.
 inline void Configure(const std::string &mode, const std::string &nodes) {
   State &state = Get();
   NS_ABORT_MSG_IF(!state.routers.empty(), "Configure DCI routing before traffic starts");
-  NS_ABORT_MSG_IF(mode != "ecmp" && mode != "spray_rr" && mode != "spray_random",
-                  "DCI_ROUTING_MODE must be ecmp, spray_rr or spray_random");
+  NS_ABORT_MSG_IF(mode != "ecmp" && mode != "spray_rr" && mode != "spray_random" && mode != "qp_fixed",
+                  "DCI_ROUTING_MODE must be ecmp, qp_fixed, spray_rr or spray_random");
   std::set<uint32_t> selected;
   std::istringstream input(nodes);
   std::string token;
@@ -96,7 +119,9 @@ inline int Choose(SwitchNode *node, const CustomHeader &ch,
     std::cout << "DCI_ROUTING_CONFIG node=" << id << " mode=" << state.mode << " ports=";
     for (size_t i = 0; i < hops.size(); ++i) std::cout << (i ? "," : "") << hops[i];
     std::cout << " candidate_count=" << hops.size()
-              << " data_only=1 control=ecmp rr_scope=qp initial_phase=ecmp"
+              << " data_only=1 control=ecmp rr_scope=qp rr_initial_phase=ecmp fixed_scope=qp fixed_key=sport_mod_candidates"
+              << " ecmp_seed=" << state.ecmpSeed
+              << " ecmp_scope=dci_data_multipath"
               << " rng_stream=" << (1700000LL + id)
               << " rng_seed=" << RngSeedManager::GetSeed()
               << " rng_run=" << RngSeedManager::GetRun() << std::endl;
@@ -105,7 +130,11 @@ inline int Choose(SwitchNode *node, const CustomHeader &ch,
   NS_ABORT_MSG_IF(initial == hops.end(), "ECMP port is not a DCI candidate");
   const Flow flow(ch.sip, ch.dip, ch.udp.sport, ch.udp.dport, ch.udp.pg);
   int selected = ecmpPort;
-  if (hops.size() > 1 && state.mode == "spray_rr") {
+  if (hops.size() > 1 && state.mode == "qp_fixed") {
+    // Controlled baseline for consecutive QP source ports.
+    // DATA stays on one path while the candidate list is unchanged.
+    selected = hops[static_cast<size_t>(ch.udp.sport) % hops.size()];
+  } else if (hops.size() > 1 && state.mode == "spray_rr") {
     auto counter = router.next.emplace(flow, static_cast<uint64_t>(initial - hops.begin()));
     selected = hops[counter.first->second % hops.size()];
     counter.first->second = (counter.first->second % hops.size() + 1) % hops.size();
@@ -116,6 +145,13 @@ inline int Choose(SwitchNode *node, const CustomHeader &ch,
       router.random->SetStream(1700000LL + id);
     }
     selected = hops[router.random->GetInteger(0, static_cast<uint32_t>(hops.size() - 1))];
+  }
+  if (hops.size() > 1 && router.flowPorts.count(flow) == 0) {
+    std::cout << "DCI_QP_PATH node=" << id << " mode=" << state.mode
+              << " sip=" << ch.sip << " dip=" << ch.dip
+              << " sport=" << ch.udp.sport << " dport=" << ch.udp.dport
+              << " pg=" << ch.udp.pg << " port=" << selected
+              << " ecmp_seed=" << state.ecmpSeed << std::endl;
   }
   router.ports[selected].packets++;
   router.ports[selected].bytes += bytes;

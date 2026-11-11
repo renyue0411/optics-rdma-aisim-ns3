@@ -304,6 +304,12 @@ TypeId RdmaHw::GetTypeId (void)
 }
 
 RdmaHw::RdmaHw(){
+	// DCQCN_CNP_V1: these options do not change DATA or reliability semantics.
+	m_independentCnp = ReadRecoveryExperimentEnv("SIMAI_CNP_MODE", 0, 1) != 0;
+	const uint64_t intervalUs = ReadRecoveryExperimentEnv("SIMAI_CNP_INTERVAL_US", 50, 1000000);
+	NS_ABORT_MSG_IF(intervalUs == 0, "SIMAI_CNP_INTERVAL_US must be 1..1000000");
+	m_cnpIntervalNs = intervalUs * 1000;
+	m_cnpTrace = ReadRecoveryExperimentEnv("SIMAI_CNP_TRACE", 0, 1) != 0;
 	m_scaleOutPlaneScheduler = SCALE_OUT_HASH;
 	m_rnicDeadlineEnabled = false;
 	m_rnicDeadlinePipelineGuardNs = 0;
@@ -460,6 +466,13 @@ bool RdmaHw::IsTimeHashReachable(uint32_t dstNodeId, uint32_t rnicPortId) const{
 }
 
 void RdmaHw::Setup(QpCompleteCallback cb,SendCompleteCallback send_cb){
+	NS_ABORT_MSG_IF(m_independentCnp && m_cc_mode != 1,
+	                "Independent CNP currently supports CC_MODE=1 only");
+	std::cout << "DCQCN_CNP_CONFIG node=" << m_node->GetId()
+	          << " version=1 mode=" << (m_independentCnp ? "independent" : "legacy_ack")
+	          << " interval_ns=" << m_cnpIntervalNs
+	          << " ce_only=" << m_independentCnp
+	          << " modeled_frame_bytes=64 np_scope=rx_qp trace=" << m_cnpTrace << std::endl;
 	tx_bytes.resize(m_nic.size());
 	last_tx_bytes.resize(m_nic.size());
 	for (uint32_t i = 0; i < m_nic.size(); i++){
@@ -1382,6 +1395,7 @@ Ptr<RdmaQueuePair> RdmaHw::CreateQueuePair(uint32_t src, uint32_t dest, uint64_t
 	qp->SetPostedLimit(initialPostedBytes);
 
 	qp->m_irnEnabled = m_irnEnabled;
+	qp->m_irnTimeoutReplay = m_irnTimeoutReplay; // IRN_TIMEOUT_REPLAY_V1
 	qp->m_irnBdpBytes = m_irnBdpBytes;
 	qp->SetWin(win);
 	qp->SetBaseRtt(baseRtt);
@@ -1556,6 +1570,8 @@ uint32_t RdmaHw::GetNicIdxOfRxQp(Ptr<RdmaRxQueuePair> q){
 }
 void RdmaHw::DeleteRxQp(uint32_t dip, uint16_t pg, uint16_t dport){
 	uint64_t key = ((uint64_t)dip << 32) | ((uint64_t)pg << 16) | (uint64_t)dport;
+	auto entry = m_rxQpMap.find(key);
+	if (entry != m_rxQpMap.end()) Simulator::Cancel(entry->second->m_cnpEvent);
 	m_rxQpMap.erase(key);
 }
 
@@ -1600,7 +1616,7 @@ void RdmaHw::SendRxControlPacket(Ptr<RdmaRxQueuePair> rxQp,
 	if (m_irnEnabled){
 		seqh.SetIrnSack(rxQp->m_irnFeedbackSeq, rxQp->m_irnFeedbackSize);
 	}
-	if (rxQp->m_ackCnpPending){
+	if (!m_independentCnp && rxQp->m_ackCnpPending){
 		seqh.SetCnp();
 	}
 
@@ -1743,7 +1759,10 @@ int RdmaHw::ReceiveUdp(Ptr<QbbNetDevice> ingressDev, Ptr<Packet> p, CustomHeader
 	rxQp->m_lastAckIntHeader = ch.udp.ih;
 	rxQp->m_lastAckTos = ch.m_tos;
 	rxQp->m_hasAckMetadata = true;
-	if (ecnbits != 0){
+	if (m_independentCnp){
+		MaybeSendIndependentCnp(rxQp, ecnbits);
+	}else if (ecnbits != 0){
+		if (ecnbits == 3) ++m_cnpCeRx;
 		rxQp->m_ecn_source.ecnbits |= ecnbits;
 		rxQp->m_ecn_source.qfb++;
 		rxQp->m_ackCnpPending = true;
@@ -1794,7 +1813,111 @@ int RdmaHw::ReceiveUdp(Ptr<QbbNetDevice> ingressDev, Ptr<Packet> p, CustomHeader
 	return 0;
 }
 
+// DCQCN_CNP_V1: protocol/feedback semantics on the existing abstract RDMA wire model.
+void RdmaHw::MaybeSendIndependentCnp(Ptr<RdmaRxQueuePair> q, uint8_t ecn){
+	if (!m_independentCnp || ecn != 3) return; // ECT(0)/ECT(1) are not congestion
+	++m_cnpCeRx;
+	q->m_cnpPending = true;
+	const uint64_t now = Simulator::Now().GetNanoSeconds();
+	if (!q->m_cnpHasSent || now - q->m_cnpLastTxNs >= m_cnpIntervalNs){
+		Simulator::Cancel(q->m_cnpEvent);
+		SendIndependentCnp(q);
+	}else if (q->m_cnpEvent.IsExpired()){
+		// Coalesce CE observations; one trailing report avoids losing a short tail.
+		q->m_cnpEvent = Simulator::Schedule(
+			NanoSeconds(m_cnpIntervalNs - (now - q->m_cnpLastTxNs)),
+			&RdmaHw::SendIndependentCnp, this, q);
+	}
+}
+
+void RdmaHw::SendIndependentCnp(Ptr<RdmaRxQueuePair> q){
+	if (!m_independentCnp || !q->m_cnpPending) return;
+	const uint64_t key = (uint64_t(q->dip) << 32) |
+	                     (uint64_t(q->m_ecn_source.qIndex) << 16) | q->dport;
+	auto it = m_rxQpMap.find(key);
+	if (it == m_rxQpMap.end() || it->second != q) return;
+	q->m_cnpPending = false;
+	q->m_cnpHasSent = true;
+	q->m_cnpLastTxNs = Simulator::Now().GetNanoSeconds();
+	// q->dport is the DATA sender's sport (RX QP stores the reverse tuple).
+	CnHeader header(q->dport, q->m_ecn_source.qIndex, 3, 0, 0);
+	// 64 modeled bytes including the fork's PPP/L2 shim, IPv4, and CNP header.
+	// This models a control packet, not a bit-exact RoCEv2 BTH/CNP frame.
+	auto packet = Create<Packet>(64 - PppHeader::GetStaticSize() - 20 - header.GetSerializedSize());
+	packet->AddHeader(header);
+	Ipv4Header ip;
+	ip.SetSource(Ipv4Address(q->sip));
+	ip.SetDestination(Ipv4Address(q->dip));
+	ip.SetProtocol(0xFF);
+	ip.SetTtl(64);
+	ip.SetPayloadSize(packet->GetSize());
+	ip.SetIdentification(q->m_ipid++);
+	if (q->m_lastAckTos == 4) ip.SetTos(4); // existing same-server convention
+	packet->AddHeader(ip);
+	AddHeader(packet, 0x800);
+	++m_cnpTx;
+	m_cnpTxBytes += packet->GetSize();
+	if (m_cnpTrace)
+		std::cout << "DCQCN_CNP_TX node=" << m_node->GetId()
+		          << " time_ns=" << q->m_cnpLastTxNs
+		          << " remote=" << q->dip << " sport=" << q->dport
+		          << " pg=" << q->m_ecn_source.qIndex
+		          << " bytes=" << packet->GetSize() << std::endl;
+	auto device = m_nic[GetNicIdxOfRxQp(q)].dev;
+	device->RdmaEnqueueHighPrioQ(packet);
+	if (((q->sip >> 8) & 0xffff) == m_node->GetId() &&
+	    m_node->GetNodeType() == 2 && q->m_lastAckTos == 4)
+		device->SwitchAsHostSend();
+	else device->TriggerTransmit();
+}
+
+void RdmaHw::PrintCnpFeedbackStats(){
+	uint64_t pending = 0;
+	for (const auto& item : m_rxQpMap)
+		if (item.second->m_cnpPending) ++pending;
+	std::cout << "DCQCN_CNP_STATS node=" << m_node->GetId()
+	          << " mode=" << (m_independentCnp ? "independent" : "legacy_ack")
+	          << " ce_rx_packets=" << m_cnpCeRx
+	          << " cnp_tx_enqueued=" << m_cnpTx
+	          << " cnp_tx_modeled_bytes=" << m_cnpTxBytes
+	          << " cnp_rx=" << m_cnpRx
+	          << " ack_feedback_rx=" << m_cnpAckFlagRx
+	          << " actual_rate_decreases=" << m_cnpRateDecreases
+	          << " unknown_qp_cnp_rx=" << m_cnpUnknownRx
+	          << " invalid_cnp_rx=" << m_cnpInvalidRx
+	          << " pending_rx_qps=" << pending << std::endl;
+}
+
+void RdmaHw::DoDispose(){
+	for (const auto& item : m_rxQpMap) {
+		Simulator::Cancel(item.second->m_cnpEvent);
+		item.second->m_cnpPending = false;
+	}
+	Object::DoDispose();
+}
+
 int RdmaHw::ReceiveCnp(Ptr<Packet> p, CustomHeader &ch){
+	if (m_independentCnp){
+		if (ch.cnp.ecnBits != 3 || m_cc_mode != 1){
+			++m_cnpInvalidRx;
+			return 0;
+		}
+		// qIndex is a PG in this simulator, including PG=1; not a CC selector.
+		auto qp = GetQp(ch.sip, ch.cnp.fid, ch.cnp.qIndex);
+		if (qp == NULL || qp->m_qpError){
+			++m_cnpUnknownRx; // late feedback after QP teardown is harmless
+			return 0;
+		}
+		++m_cnpRx;
+		++qp_cnp[GetQpKey(qp->dip.Get(), qp->sport, qp->m_pg)];
+		if (m_cnpTrace)
+			std::cout << "DCQCN_CNP_RX node=" << m_node->GetId()
+			          << " time_ns=" << Simulator::Now().GetNanoSeconds()
+			          << " remote=" << ch.sip << " sport=" << qp->sport
+			          << " pg=" << qp->m_pg << std::endl;
+		cnp_received_mlx(qp);
+		return 0;
+	}
 	// QCN on NIC
 	// This is a Congestion signal
 	// Then, extract data from the congestion packet.
@@ -1920,6 +2043,7 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 		}
 		if (qp->m_irnRecovery && qp->snd_una >= qp->m_irnRecoveryEnd){
 			qp->m_irnRecovery = false;
+			qp->m_irnTimeoutSweep = false; // IRN_TIMEOUT_REPLAY_V1
 		}
 		// Equivalent to ConWeave's nonzero irnNackSize recovery hint.
 		if (ch.ack.irnSackBytes && ch.ack.irnSackSeq >= qp->snd_una && !qp->m_irnRecovery){
@@ -1984,7 +2108,8 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 	}
 
 	// handle cnp
-	if (cnp){
+	if (cnp) ++m_cnpAckFlagRx;
+	if (cnp && !m_independentCnp){
 		uint64_t key = GetQpKey(qp->dip.Get(), qp->sport, qp->m_pg);
 		qp_cnp[key]++; // update for the number of cnp this qp has received
 		if (m_cc_mode == 1){ // mlx version
@@ -2036,6 +2161,17 @@ void RdmaHw::ConfigureIrn(uint64_t bdp, uint64_t low, uint64_t high){
 	NS_ABORT_MSG_IF(IsRcAckRetryEnabled() || m_rnicDeadlineEnabled || m_rnicAckRecoveryEnabled,
 	                "IRN cannot share a QP with legacy RC/OCS recovery timers");
 	NS_ABORT_MSG_IF(m_backto0, "IRN requires L2_BACK_TO_ZERO=0");
+	// IRN_TIMEOUT_REPLAY_V1: opt-in policy, no random objects or wire changes.
+	const char* timeoutReplay = std::getenv("SIMAI_IRN_TIMEOUT_REPLAY");
+	NS_ABORT_MSG_IF(timeoutReplay && std::string(timeoutReplay) != "0" &&
+	                std::string(timeoutReplay) != "1",
+	                "SIMAI_IRN_TIMEOUT_REPLAY must be 0 or 1");
+	m_irnTimeoutReplay = timeoutReplay && std::string(timeoutReplay) == "1";
+	std::cout << "IRN_TIMEOUT_RECOVERY_CONFIG node="
+	          << (m_node ? m_node->GetId() : 0xffffffffU)
+	          << " replay=" << m_irnTimeoutReplay
+	          << " policy=" << (m_irnTimeoutReplay ? "bounded_timeout_replay" : "legacy_v11")
+	          << " sack_skip=1 scope=already_sent_at_timeout" << std::endl;
 	m_irnEnabled = true;
 	m_irnBdpBytes = bdp;
 	m_irnRtoLowNs = low;
@@ -2107,6 +2243,9 @@ void RdmaHw::HandleIrnTimeout(Ptr<RdmaQueuePair> qp, Time scheduledRto){
 	qp->m_timeoutCount++;
 	IrnDiagnosticsV1::Recovery(qp, "timeout");
 	qp->StartIrnRecovery();
+	// Capture the sent frontier in StartIrnRecovery, never the lifetime QP size.
+	qp->m_irnTimeoutSweep = qp->m_irnTimeoutReplay;
+	if (qp->m_irnTimeoutSweep) ++qp->m_irnTimeoutSweeps;
 	RecoverQueue(qp);
 	const uint32_t idx = GetNicIdxOfQp(qp);
 	m_nic[idx].dev->TriggerTransmit();
@@ -2117,10 +2256,13 @@ void RdmaHw::PrintIrnStats(){
 	if (!m_irnEnabled) return;
 	IrnValidationV1::Report(this);
 	IrnDiagnosticsV1::Report(m_node->GetId());
+	uint64_t timeoutSweeps = 0, timeoutSweepPackets = 0;
 	uint64_t retx = 0, timeouts = 0, sacks = 0, outstanding = 0;
 	uint64_t ooo = 0, dup = 0, drops = 0, peak = 0;
 	for (const auto &p : m_qpMap){
 		IrnDiagnosticsV1::Counters(p.second);
+		timeoutSweeps += p.second->m_irnTimeoutSweeps;
+		timeoutSweepPackets += p.second->m_irnTimeoutSweepPackets;
 		retx += p.second->m_retransBytes;
 		timeouts += p.second->m_timeoutCount;
 		sacks += p.second->m_irnSackFeedback;
@@ -2133,7 +2275,10 @@ void RdmaHw::PrintIrnStats(){
 		peak = std::max<uint64_t>(peak, p.second->m_irnPeakRanges);
 	}
 	std::cout << "IRN_STATS node=" << m_node->GetId()
-	          << " recovery_version=11"
+	          << " recovery_version=" << (m_irnTimeoutReplay ? 12 : 11)
+	          << " timeout_replay=" << m_irnTimeoutReplay
+	          << " timeout_sweeps=" << timeoutSweeps
+	          << " timeout_sweep_retrans_packets=" << timeoutSweepPackets
 	          << " live_qps=" << m_qpMap.size()
 	          << " live_qp_retrans_bytes=" << retx
 	          << " live_qp_timeouts=" << timeouts
@@ -2419,7 +2564,8 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	if (qp->m_irnEnabled){
 		if (packetSeq < qp->m_highestSentSeq){
 			NS_ABORT_MSG_IF(!qp->m_irnRecovery ||
-			                (!qp->m_irnForceFirst && packetSeq >= qp->m_irnHighestSackEnd),
+			                (!qp->m_irnForceFirst && packetSeq >= qp->m_irnHighestSackEnd &&
+			                 !(qp->m_irnTimeoutSweep && packetSeq < qp->m_irnRecoveryEnd)),
 			                "IRN retransmission lacks higher-sequence SACK evidence");
 			const auto packet = qp->m_irnSentPackets.find(packetSeq);
 			NS_ABORT_MSG_IF(packet == qp->m_irnSentPackets.end(),
@@ -2519,6 +2665,8 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	IrnDiagnosticsV1::Generate(qp, p, packetSeq, payload_size, packetSeq < qp->m_highestSentSeq);
 	if (packetSeq < qp->m_highestSentSeq){
 		if (qp->m_irnEnabled){
+			if (qp->m_irnTimeoutSweep && packetSeq < qp->m_irnRecoveryEnd)
+				++qp->m_irnTimeoutSweepPackets;
 			qp->m_irnRetransmitNext = packetSeq + payload_size;
 			qp->m_irnForceFirst = false;
 		}
@@ -2689,7 +2837,9 @@ void RdmaHw::cnp_received_mlx(Ptr<RdmaQueuePair> q){
 		// schedule rate decrease
 		ScheduleDecreaseRateMlx(q, 1); // add 1 ns to make sure rate decrease is after alpha update
 		// set rate on first CNP
+		const uint64_t firstOldRate = q->m_rate.GetBitRate();
 		q->mlx.m_targetRate = q->m_rate = m_rateOnFirstCNP * q->m_rate;
+		if (q->m_rate.GetBitRate() < firstOldRate) ++m_cnpRateDecreases;
 		q->mlx.m_first_cnp = false;
 	}
 }
@@ -2707,7 +2857,16 @@ void RdmaHw::CheckRateDecreaseMlx(Ptr<RdmaQueuePair> q){
 		}
 		if (clamp)
 			q->mlx.m_targetRate = q->m_rate;
+		const uint64_t oldRate = q->m_rate.GetBitRate();
 		q->m_rate = std::max(m_minRate, q->m_rate * (1 - q->mlx.m_alpha / 2));
+		if (q->m_rate.GetBitRate() < oldRate) ++m_cnpRateDecreases;
+		if (m_cnpTrace)
+			std::cout << "DCQCN_RATE_UPDATE node=" << m_node->GetId()
+			          << " time_ns=" << Simulator::Now().GetNanoSeconds()
+			          << " remote=" << q->dip.Get() << " sport=" << q->sport
+			          << " pg=" << q->m_pg << " old_bps=" << oldRate
+			          << " new_bps=" << q->m_rate.GetBitRate()
+			          << " alpha=" << q->mlx.m_alpha << std::endl;
 		// reset rate increase related things
 		q->mlx.m_rpTimeStage = 0;
 		q->mlx.m_decrease_cnp_arrived = false;

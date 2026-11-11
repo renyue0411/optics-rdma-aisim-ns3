@@ -33,6 +33,12 @@ namespace ns3 {
 class CustomHeader : public Header 
 {
 public:
+  // Reserved private UDP control service; ordinary RDMA headers are unchanged.
+  static constexpr uint16_t DCI_PATH_CONTROL_PORT = 49000;
+  bool IsDciPathControl() const {
+    return l3Prot == 0x11 && udp.sport == DCI_PATH_CONTROL_PORT &&
+      udp.dport == DCI_PATH_CONTROL_PORT;
+  }
   /**
    * \brief Construct a null custom header
    */

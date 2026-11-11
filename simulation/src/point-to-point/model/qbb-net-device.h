@@ -97,6 +97,12 @@ public:
    */
   virtual void Receive (Ptr<Packet> p);
 
+  // One direct-WAN control service per interface; no RDMA QP is created.
+  void SetDciControlReceiver(Callback<bool, Ptr<Packet>, uint32_t> receiver) {
+    m_dciControlReceiver = receiver;
+  }
+  bool HasDciControlReceiver() const { return !m_dciControlReceiver.IsNull(); }
+
   /**
    * Send a packet to the channel by putting it to the queue
    * of the corresponding priority class
@@ -145,6 +151,13 @@ public:
    bool SwitchAsHostTransmitStart(Ptr<Packet> p);
    void SwitchAsHostTransmitComplete(void);
    
+	
+  // DCI_WAN_PFC_V1: observe actual PFC traffic separately from DATA.
+  uint64_t m_dciPfcTx = 0, m_dciPfcRx = 0, m_dciPfcIgnored = 0;
+  uint64_t m_dciPfcTxSuppressed = 0;
+  bool IsPfcEnabled() const { return m_qbbEnabled; }
+  bool IsPfcPaused(uint32_t queue) const { NS_ASSERT(queue < qCnt); return m_paused[queue]; }
+
 	void SendPfc(uint32_t qIndex, uint32_t type); // type: 0 = pause, 1 = resume
   Ptr<Packet> NICSendPfc(uint32_t qIndex, uint32_t type);
 
@@ -179,6 +192,7 @@ protected:
    * @see class InfiniteQueue
    */
   Ptr<BEgressQueue> m_queue;
+  Callback<bool, Ptr<Packet>, uint32_t> m_dciControlReceiver;
 
   Ptr<QbbChannel> m_channel;
   

@@ -3,6 +3,7 @@
 
 #include <unordered_map>
 #include <ns3/node.h>
+#include <ns3/abort.h>
 
 namespace ns3 {
 
@@ -16,6 +17,20 @@ public:
 	static TypeId GetTypeId (void);
 
 	SwitchMmu(void);
+	// DCI_WAN_POOL_V1: WAN ingress shares a finite lossy pool; LAN PFC is retained.
+	bool m_dciWanPool = false;
+	bool m_dciWanPort[pCnt] = {};
+	uint64_t m_dciDataUsed = 0, m_dciDataPeak = 0, m_dciAdmissionDrops = 0;
+	void ConfigDciWanPort(uint32_t port) {
+		NS_ABORT_MSG_IF(m_dciDataUsed != 0 || port == 0 || port >= pCnt,
+		                "WAN pool must be configured before DATA arrives");
+		m_dciWanPool = true; m_dciWanPort[port] = true; headroom[port] = 0;
+	}
+	uint64_t DciSharedCapacity() const {
+		const uint64_t reserved = uint64_t(total_hdrm) + total_rsrv;
+		return reserved < buffer_size ? uint64_t(buffer_size) - reserved : 0;
+	}
+
 
 	bool CheckIngressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize);
 	bool CheckEgressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize);

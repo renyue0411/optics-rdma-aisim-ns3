@@ -110,3 +110,41 @@ foreach(subdir ${scratch_subdirectories})
   endif()
 endforeach()
 
+# DCI routing check: retain applications dependency
+if(TARGET scratch_dci-routing-check)
+  target_link_libraries(scratch_dci-routing-check ${libapplications})
+  target_link_options(scratch_dci-routing-check PRIVATE "-Wl,--no-as-needed")
+endif()
+
+# DCI_PM_STANDALONE_LINK_FIX_V1
+# SimpleSeqTsHeader is implemented by applications.
+if(TARGET scratch_dci-path-manager-check)
+  target_link_libraries(scratch_dci-path-manager-check ${libapplications})
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(scratch_dci-path-manager-check PRIVATE "LINKER:--no-as-needed")
+  endif()
+endif()
+
+# IRN_TIMEOUT_REPLAY_CHECK_LINK_V1
+if(TARGET scratch_irn-timeout-replay-check)
+  target_link_libraries(scratch_irn-timeout-replay-check ${libapplications})
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(scratch_irn-timeout-replay-check PRIVATE "LINKER:--no-as-needed")
+  endif()
+endif()
+
+# DCQCN_CNP_CHECK_LINK_V1
+if(TARGET scratch_dcqcn-cnp-check)
+  target_link_libraries(scratch_dcqcn-cnp-check ${libapplications})
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(scratch_dcqcn-cnp-check PRIVATE "LINKER:--no-as-needed")
+  endif()
+endif()
+
+# DCI_WAN_PROFILE_CHECK_LINK_V1
+if(TARGET scratch_dci-wan-profile-check)
+  target_link_libraries(scratch_dci-wan-profile-check ${libapplications})
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(scratch_dci-wan-profile-check PRIVATE "LINKER:--no-as-needed")
+  endif()
+endif()

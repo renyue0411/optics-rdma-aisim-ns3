@@ -35,6 +35,7 @@ build_lib(
     model/rdma-queue-pair.cc
     model/rdma-hw.cc
     model/switch-node.cc
+    model/dci-path-manager-app.cc
     model/switch-mmu.cc
     model/nvswitch-node.cc
     model/ocs-node.cc
@@ -61,6 +62,7 @@ build_lib(
     model/rdma-queue-pair.h
     model/rdma-hw.h
     model/switch-node.h
+    model/dci-path-manager-app.h
     model/switch-mmu.h
     model/trace-format.h
     model/nvswitch-node.h

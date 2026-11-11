@@ -75,6 +75,11 @@ public:
 	uint64_t m_irnHighestSackEnd = 0;
 	uint64_t m_irnRetransmitNext = 0;
 	bool m_irnForceFirst = false;
+	// IRN_TIMEOUT_REPLAY_V1: optional, bounded retransmission after timeout.
+	bool m_irnTimeoutReplay = false;
+	bool m_irnTimeoutSweep = false;
+	uint64_t m_irnTimeoutSweeps = 0;
+	uint64_t m_irnTimeoutSweepPackets = 0;
 	void StartIrnRecovery();
 	IrnSackManager m_irnSack;
 	std::map<uint64_t, uint32_t> m_irnSentPackets;
@@ -281,6 +286,12 @@ public:
 	IntHeader m_lastAckIntHeader;
 	uint8_t m_lastAckTos;
 	bool m_ackCnpPending;
+	// DCQCN_CNP_V1: one NP limiter and at most one pending event per RX QP.
+	bool m_cnpHasSent = false;
+	bool m_cnpPending = false;
+	uint64_t m_cnpLastTxNs = 0;
+	EventId m_cnpEvent;
+
 	bool m_hasAckMetadata;
 	uint64_t m_ackGeneratedCount;
 	uint64_t m_ackFlushCount;

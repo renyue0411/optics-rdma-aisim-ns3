@@ -89,13 +89,16 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 		buf.u32[2] = ch.udp.sport | ((uint32_t)ch.udp.dport << 16);
 	else if (ch.l3Prot == 0xFC || ch.l3Prot == 0xFD)
 		buf.u32[2] = ch.ack.sport | ((uint32_t)ch.ack.dport << 16);
+	else if (ch.l3Prot == 0xFF) // DCQCN_CNP_V1: initialize the synthetic CNP hash key
+		buf.u32[2] = ch.cnp.fid | (uint32_t(ch.cnp.qIndex) << 16);
 
-	uint32_t idx = EcmpHash(buf.u8, 12, m_ecmpSeed) % nexthops.size();
+	uint32_t idx = EcmpHash(buf.u8, 12, DciSprayV1::EcmpSeed(this, ch, m_ecmpSeed, nexthops.size())) % nexthops.size();
 	return DciSprayV1::Choose(this, ch, nexthops, nexthops[idx], p->GetSize());
 }
 
 void SwitchNode::CheckAndSendPfc(uint32_t inDev, uint32_t qIndex){
 	Ptr<QbbNetDevice> device = DynamicCast<QbbNetDevice>(m_devices[inDev]);
+	if (!device->IsPfcEnabled()) return; // DCI_WAN_PFC_V1: do not set a phantom MMU pause
 	if (m_mmu->CheckShouldPause(inDev, qIndex)){
 		device->SendPfc(qIndex, 0);
 		m_mmu->SetPause(inDev, qIndex);
@@ -103,6 +106,7 @@ void SwitchNode::CheckAndSendPfc(uint32_t inDev, uint32_t qIndex){
 }
 void SwitchNode::CheckAndSendResume(uint32_t inDev, uint32_t qIndex){
 	Ptr<QbbNetDevice> device = DynamicCast<QbbNetDevice>(m_devices[inDev]);
+	if (!device->IsPfcEnabled()) return; // DCI_WAN_PFC_V1
 	if (m_mmu->CheckShouldResume(inDev, qIndex)){
 		device->SendPfc(qIndex, 1);
 		m_mmu->SetResume(inDev, qIndex);
@@ -331,7 +335,15 @@ void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Pack
 	}
 	if (1){
 		uint8_t* buf = p->GetBuffer();
-		if (buf[PppHeader::GetStaticSize() + 9] == 0x11){ // udp packet
+		const uint32_t udpOffset = PppHeader::GetStaticSize() + 20;
+		const uint16_t controlPort = CustomHeader::DCI_PATH_CONTROL_PORT;
+		const bool dciControl = p->GetSize() >= udpOffset + 8 &&
+			buf[udpOffset] == (controlPort >> 8) &&
+			buf[udpOffset + 1] == (controlPort & 0xff) &&
+			buf[udpOffset + 2] == (controlPort >> 8) &&
+			buf[udpOffset + 3] == (controlPort & 0xff);
+		// Control UDP has no INT header. Preserve ordinary DATA telemetry.
+		if (buf[PppHeader::GetStaticSize() + 9] == 0x11 && !dciControl){
 			IntHeader *ih = (IntHeader*)&buf[PppHeader::GetStaticSize() + 20 + 8 + 6]; // ppp, ip, udp, SeqTs, INT
 			Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(m_devices[ifIndex]);
 			if (m_ccMode == 3){ // HPCC

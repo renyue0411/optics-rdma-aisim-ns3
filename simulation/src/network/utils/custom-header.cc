@@ -93,7 +93,7 @@ uint32_t CustomHeader::GetSerializedSize (void) const{
 		if (l3Prot == 0x6) // TCP
 			len += tcp.length * 4;
 		else if (l3Prot == 0x11) // UDP
-			len += GetUdpHeaderSize();
+			len += IsDciPathControl() ? 8 : GetUdpHeaderSize();
 		else if (l3Prot == 0xFC || l3Prot == 0xFD)
 			len += GetAckSerializedSize() + ((ack.flags & 2) ? 12 : 0);
 		else if (l3Prot == 0xFF)
@@ -158,10 +158,12 @@ void CustomHeader::Serialize (Buffer::Iterator start) const{
 		  i.WriteHtonU16 (udp.dport);
 		  i.WriteHtonU16 (udp.payload_size);
 		  i.WriteHtonU16 (0);
-		  // SeqTsHeader
-		  i.WriteHtonU64 (udp.seq);
-		  i.WriteHtonU16 (udp.pg);
-		  udp.ih.Serialize(i);
+		  if (!IsDciPathControl()) {
+			  // SeqTsHeader is present only in RDMA DATA, not control UDP.
+			  i.WriteHtonU64 (udp.seq);
+			  i.WriteHtonU16 (udp.pg);
+			  udp.ih.Serialize(i);
+		  }
 	  }else if (l3Prot == 0xFF){ // CNP
 		  i.WriteU8(cnp.qIndex);
 		  i.WriteU16(cnp.fid);
@@ -294,13 +296,17 @@ CustomHeader::Deserialize (Buffer::Iterator start)
 			  i.Next(2);
 		  }
 
-		  // SeqTsHeader
-		  udp.seq = i.ReadNtohU64 ();
-		  udp.pg =  i.ReadNtohU16 ();
-		  if (getInt)
-			  udp.ih.Deserialize(i);
-
-		  l4Size = GetUdpHeaderSize();
+		  if (IsDciPathControl()) {
+			  udp.seq = 0;
+			  udp.pg = 0;
+			  l4Size = 8;
+		  } else {
+			  // SeqTsHeader
+			  udp.seq = i.ReadNtohU64 ();
+			  udp.pg = i.ReadNtohU16 ();
+			  if (getInt) udp.ih.Deserialize(i);
+			  l4Size = GetUdpHeaderSize();
+		  }
 	  }else if (l3Prot == 0xFF){
 		  cnp.qIndex = i.ReadU8();
 		  cnp.fid = i.ReadU16();

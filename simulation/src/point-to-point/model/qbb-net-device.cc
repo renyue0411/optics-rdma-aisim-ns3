@@ -315,6 +315,7 @@ namespace ns3 {
 			Simulator::Cancel(m_calendarEvent);
 		}
 		PointToPointNetDevice::DoDispose();
+		m_dciControlReceiver = Callback<bool, Ptr<Packet>, uint32_t>();
 	}
 
 	void
@@ -689,8 +690,16 @@ namespace ns3 {
 		CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
 		ch.getInt = 1; // parse INT header
 		packet->PeekHeader(ch);
+		if (ch.IsDciPathControl()) {
+			// V1 is a direct-link service. Consume its reserved UDP packets
+			// locally even when no service is listening; never feed RdmaHw.
+			if (!m_dciControlReceiver.IsNull())
+				m_dciControlReceiver(packet, m_ifIndex);
+			return;
+		}
 		if (ch.l3Prot == 0xFE){ // PFC
-			if (!m_qbbEnabled) return;
+			++m_dciPfcRx; // DCI_WAN_PFC_V1
+			if (!m_qbbEnabled){ ++m_dciPfcIgnored; return; }
 			unsigned qIndex = ch.pfc.qIndex;
 			if (ch.pfc.time > 0){
 				m_tracePfc(1);
@@ -767,6 +776,9 @@ namespace ns3 {
 	}
 
 	void QbbNetDevice::SendPfc(uint32_t qIndex, uint32_t type){
+		// DCI_WAN_PFC_V1: disabled means no transmitted PAUSE/RESUME.
+		if (!m_qbbEnabled){ ++m_dciPfcTxSuppressed; return; }
+		++m_dciPfcTx;
 		Ptr<Packet> p = Create<Packet>(0);
 		PauseHeader pauseh((type == 0 ? m_pausetime : 0), m_queue->GetNBytes(qIndex), qIndex);
 		p->AddHeader(pauseh);

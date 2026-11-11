@@ -72,6 +72,8 @@ int NVSwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 		buf.u32[2] = ch.udp.sport | ((uint32_t)ch.udp.dport << 16);
 	else if (ch.l3Prot == 0xFC || ch.l3Prot == 0xFD)
 		buf.u32[2] = ch.ack.sport | ((uint32_t)ch.ack.dport << 16);
+	else if (ch.l3Prot == 0xFF) // DCQCN_CNP_V1: initialize the synthetic CNP hash key
+		buf.u32[2] = ch.cnp.fid | (uint32_t(ch.cnp.qIndex) << 16);
 
 	uint32_t idx = EcmpHash(buf.u8, 12, m_ecmpSeed) % nexthops.size();
 	return nexthops[idx];

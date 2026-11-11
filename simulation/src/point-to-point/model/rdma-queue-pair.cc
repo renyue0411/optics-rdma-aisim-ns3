@@ -389,6 +389,8 @@ void RdmaQueuePair::SetAppSentCallback(Callback<void> notifyAppSent){
 
 // IRN_RECOVERY_V11: independent recovery scan and fresh-data frontier.
 void RdmaQueuePair::StartIrnRecovery(){
+	// Ordinary SACK-driven recovery never inherits timeout replay permission.
+	m_irnTimeoutSweep = false; // IRN_TIMEOUT_REPLAY_V1
 	m_irnRecovery = true;
 	m_irnRecoveryEnd = m_highestSentSeq;
 	m_irnRetransmitNext = snd_una;
@@ -410,7 +412,8 @@ uint64_t RdmaQueuePair::GetBytesLeft(){
 			// Keep the scan position when resuming new DATA: a later SACK
 			// may reveal another hole behind the fresh-data frontier.
 			if (m_irnRetransmitNext < m_highestSentSeq &&
-			    (m_irnForceFirst || m_irnRetransmitNext < m_irnHighestSackEnd)){
+			    (m_irnForceFirst || m_irnRetransmitNext < m_irnHighestSackEnd ||
+			     (m_irnTimeoutSweep && m_irnRetransmitNext < m_irnRecoveryEnd))){
 				snd_nxt = m_irnRetransmitNext;
 			}
 		}

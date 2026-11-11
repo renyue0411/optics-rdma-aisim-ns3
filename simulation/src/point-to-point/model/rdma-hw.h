@@ -38,6 +38,18 @@ public:
 
 	static TypeId GetTypeId (void);
 	RdmaHw();
+	// DCQCN_CNP_V1: explicit, CE-only NP feedback; defaults preserve legacy.
+	bool m_independentCnp = false;
+	uint64_t m_cnpIntervalNs = 50000;
+	bool m_cnpTrace = false;
+	uint64_t m_cnpCeRx = 0, m_cnpTx = 0, m_cnpRx = 0, m_cnpTxBytes = 0;
+	uint64_t m_cnpUnknownRx = 0, m_cnpInvalidRx = 0;
+	uint64_t m_cnpAckFlagRx = 0, m_cnpRateDecreases = 0;
+	void MaybeSendIndependentCnp(Ptr<RdmaRxQueuePair> q, uint8_t ecn);
+	void SendIndependentCnp(Ptr<RdmaRxQueuePair> q);
+	void PrintCnpFeedbackStats();
+	void DoDispose() override;
+
 
 	static void PrintGlobalEcnUsefulStats();
 
@@ -46,6 +58,7 @@ public:
 
 	// IRN_PORT_V1. Mode-0 experimental transport extension, off by default.
 	bool m_irnEnabled = false;
+	bool m_irnTimeoutReplay = false; // IRN_TIMEOUT_REPLAY_V1
 	uint64_t m_irnBdpBytes = 0;
 	uint64_t m_irnRtoLowNs = 0;
 	uint64_t m_irnRtoHighNs = 0;
