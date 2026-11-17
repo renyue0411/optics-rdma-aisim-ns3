@@ -326,6 +326,7 @@ namespace ns3 {
 		NS_ASSERT_MSG(m_txMachineState == BUSY, "Must be BUSY if transmitting");
 		m_txMachineState = READY;
 		NS_ASSERT_MSG(m_currentPkt != 0, "QbbNetDevice::TransmitComplete(): m_currentPkt zero");
+		m_localTxCompletedBytes += m_currentPkt->GetSize();
 		m_phyTxEndTrace(m_currentPkt);
 		m_currentPkt = 0;
 		DequeueAndTransmit();
@@ -336,6 +337,7 @@ namespace ns3 {
 		NS_ASSERT_MSG(m_txMachineState == BUSY, "Must be BUSY if transmitting");
 		m_txMachineState = READY;
 		NS_ASSERT_MSG(m_currentPkt != 0, "QbbNetDevice::TransmitComplete(): m_currentPkt zero");
+		m_localTxCompletedBytes += m_currentPkt->GetSize();
 		m_phyTxEndTrace(m_currentPkt);
 		m_currentPkt = 0;
 		SwitchAsHostSend();
@@ -689,10 +691,14 @@ namespace ns3 {
 		m_macRxTrace(packet);
 		CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
 		ch.getInt = 1; // parse INT header
-		packet->PeekHeader(ch);
+		if (packet->PeekHeader(ch) == 0) {
+			m_traceDrop(packet, 0);
+			return;
+		}
 		if (ch.IsDciPathControl()) {
-			// V1 is a direct-link service. Consume its reserved UDP packets
-			// locally even when no service is listening; never feed RdmaHw.
+			// Only the private PM wire format is consumed here. Ordinary DATA
+			// using the same UDP ports retains its normal forwarding behavior.
+			// A stopped direct-link service still discards its control messages.
 			if (!m_dciControlReceiver.IsNull())
 				m_dciControlReceiver(packet, m_ifIndex);
 			return;
@@ -727,7 +733,7 @@ namespace ns3 {
 				return;
 			}
 
-			if (m_node->GetNodeType() > 0 && ch.m_tos != 4 && did != m_node->GetId()){ // switch
+			if (m_node->GetNodeType() > 0 && (ch.m_tos & 0xfc) != 4 && did != m_node->GetId()){ // switch
 				// std::cout << "id: " << m_node->GetId() << " switch receive from " << sid << std::endl;
 				packet->AddPacketTag(FlowIdTag(m_ifIndex));
 				m_node->SwitchReceiveFromDevice(this, packet, ch);

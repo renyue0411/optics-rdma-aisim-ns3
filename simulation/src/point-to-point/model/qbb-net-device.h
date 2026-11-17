@@ -152,6 +152,11 @@ public:
    void SwitchAsHostTransmitComplete(void);
    
 	
+  // Local serialization completion; includes modeled packet headers.
+  uint64_t GetLocalTxCompletedBytes() const {
+    return m_localTxCompletedBytes;
+  }
+
   // DCI_WAN_PFC_V1: observe actual PFC traffic separately from DATA.
   uint64_t m_dciPfcTx = 0, m_dciPfcRx = 0, m_dciPfcIgnored = 0;
   uint64_t m_dciPfcTxSuppressed = 0;
@@ -168,6 +173,8 @@ public:
 protected:
 
 	//Ptr<Node> m_node;
+
+  uint64_t m_localTxCompletedBytes = 0;
 
   bool TransmitStart (Ptr<Packet> p);
   

@@ -471,7 +471,7 @@ void RdmaHw::Setup(QpCompleteCallback cb,SendCompleteCallback send_cb){
 	std::cout << "DCQCN_CNP_CONFIG node=" << m_node->GetId()
 	          << " version=1 mode=" << (m_independentCnp ? "independent" : "legacy_ack")
 	          << " interval_ns=" << m_cnpIntervalNs
-	          << " ce_only=" << m_independentCnp
+	          << " ce_only=" << 1
 	          << " modeled_frame_bytes=64 np_scope=rx_qp trace=" << m_cnpTrace << std::endl;
 	tx_bytes.resize(m_nic.size());
 	last_tx_bytes.resize(m_nic.size());
@@ -1631,7 +1631,7 @@ void RdmaHw::SendRxControlPacket(Ptr<RdmaRxQueuePair> rxQp,
 	head.SetTtl(64);
 	head.SetPayloadSize(newp->GetSize());
 	head.SetIdentification(rxQp->m_ipid++);
-	if (rxQp->m_lastAckTos == 4){
+	if ((rxQp->m_lastAckTos & 0xfc) == 4){
 		head.SetTos(4);
 	}
 
@@ -1644,7 +1644,7 @@ void RdmaHw::SendRxControlPacket(Ptr<RdmaRxQueuePair> rxQp,
 	const uint32_t localNode = (rxQp->sip >> 8) & 0xffff;
 	if (localNode == m_node->GetId() &&
 		m_node->GetNodeType() == 2 &&
-		rxQp->m_lastAckTos == 4){
+		(rxQp->m_lastAckTos & 0xfc) == 4){
 		m_nic[nicIdx].dev->SwitchAsHostSend();
 	}else{
 		m_nic[nicIdx].dev->TriggerTransmit();
@@ -1761,7 +1761,7 @@ int RdmaHw::ReceiveUdp(Ptr<QbbNetDevice> ingressDev, Ptr<Packet> p, CustomHeader
 	rxQp->m_hasAckMetadata = true;
 	if (m_independentCnp){
 		MaybeSendIndependentCnp(rxQp, ecnbits);
-	}else if (ecnbits != 0){
+	}else if (ecnbits == CustomHeader::ECN_CE){
 		if (ecnbits == 3) ++m_cnpCeRx;
 		rxQp->m_ecn_source.ecnbits |= ecnbits;
 		rxQp->m_ecn_source.qfb++;
@@ -1810,6 +1810,9 @@ int RdmaHw::ReceiveUdp(Ptr<QbbNetDevice> ingressDev, Ptr<Packet> p, CustomHeader
 		rxQp->m_duplicateAckCount++;
 		SendRxControlPacket(rxQp, false, "duplicate");
 	}
+	// Observe local reception after normal control-packet handling. No new event.
+	if (acceptedBytes != 0 && !m_rxProgressCallback.IsNull())
+		m_rxProgressCallback(rxQp, rxQp->ReceiverNextExpectedSeq);
 	return 0;
 }
 
@@ -1852,7 +1855,7 @@ void RdmaHw::SendIndependentCnp(Ptr<RdmaRxQueuePair> q){
 	ip.SetTtl(64);
 	ip.SetPayloadSize(packet->GetSize());
 	ip.SetIdentification(q->m_ipid++);
-	if (q->m_lastAckTos == 4) ip.SetTos(4); // existing same-server convention
+	if ((q->m_lastAckTos & 0xfc) == 4) ip.SetTos(4); // existing same-server convention
 	packet->AddHeader(ip);
 	AddHeader(packet, 0x800);
 	++m_cnpTx;
@@ -1866,7 +1869,7 @@ void RdmaHw::SendIndependentCnp(Ptr<RdmaRxQueuePair> q){
 	auto device = m_nic[GetNicIdxOfRxQp(q)].dev;
 	device->RdmaEnqueueHighPrioQ(packet);
 	if (((q->sip >> 8) & 0xffff) == m_node->GetId() &&
-	    m_node->GetNodeType() == 2 && q->m_lastAckTos == 4)
+	    m_node->GetNodeType() == 2 && (q->m_lastAckTos & 0xfc) == 4)
 		device->SwitchAsHostSend();
 	else device->TriggerTransmit();
 }
@@ -2600,6 +2603,8 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	ipHeader.SetTtl(64);
 	if (qp->nvls_enable == 1) ipHeader.SetTos(4);
 	else ipHeader.SetTos(0);
+	// DCQCN DATA declares ECN capability. Preserve the existing NVLS DSCP.
+	if (m_cc_mode == 1) ipHeader.SetEcn(Ipv4Header::ECN_ECT0);
 	ipHeader.SetIdentification(qp->m_ipid);
 	p->AddHeader(ipHeader);
 

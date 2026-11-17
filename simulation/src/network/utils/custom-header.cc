@@ -29,6 +29,22 @@ NS_LOG_COMPONENT_DEFINE ("CustomHeader");
 
 NS_OBJECT_ENSURE_REGISTERED (CustomHeader);
 
+// DCI_CONTROL_CLASSIFICATION_V1. UDP length includes its eight-byte header.
+// Payload magic identifies the protocol; its version/fields are validated by
+// DciPathManagerApp. Keep unsupported versions out of the RDMA DATA parser too.
+bool CustomHeader::IsDciPathControlUdp(const uint8_t* data, uint32_t bytes) {
+  if (bytes != 48 && bytes != 64) return false;
+  const uint16_t sport = (uint16_t(data[0]) << 8) | data[1];
+  const uint16_t dport = (uint16_t(data[2]) << 8) | data[3];
+  const uint16_t length = (uint16_t(data[4]) << 8) | data[5];
+  if (sport != DCI_PATH_CONTROL_PORT || dport != DCI_PATH_CONTROL_PORT ||
+      length != bytes) return false;
+  const uint32_t magic = (uint32_t(data[8]) << 24) |
+    (uint32_t(data[9]) << 16) | (uint32_t(data[10]) << 8) | data[11];
+  return (bytes == 48 && magic == 0x4443504d) || // DCPM probe/reply
+         (bytes == 64 && magic == 0x44434246);   // DCBF business feedback
+}
+
 CustomHeader::CustomHeader ()
   : brief(1), headerType(L3_Header | L4_Header), 
 	getInt(1),
@@ -192,6 +208,7 @@ void CustomHeader::Serialize (Buffer::Iterator start) const{
 uint32_t
 CustomHeader::Deserialize (Buffer::Iterator start)
 {
+  m_dciPathControl = false;
   Buffer::Iterator i = start;
 
   // L2
@@ -287,6 +304,7 @@ CustomHeader::Deserialize (Buffer::Iterator start)
 		  i = start;
 		  i.Next(l2Size + l3Size);
 		  // udp header
+		  Buffer::Iterator udpStart = i;
 		  udp.sport = i.ReadNtohU16 ();
 		  udp.dport = i.ReadNtohU16 ();
 		  if (brief){
@@ -296,11 +314,21 @@ CustomHeader::Deserialize (Buffer::Iterator start)
 			  i.Next(2);
 		  }
 
+		  if (udp.sport == DCI_PATH_CONTROL_PORT &&
+		      udp.dport == DCI_PATH_CONTROL_PORT &&
+		      (i.GetRemainingSize() == 40 || i.GetRemainingSize() == 56)) {
+			  const uint32_t bytes = 8 + i.GetRemainingSize();
+			  uint8_t datagram[64];
+			  udpStart.Read(datagram, bytes);
+			  m_dciPathControl = IsDciPathControlUdp(datagram, bytes);
+		  }
 		  if (IsDciPathControl()) {
 			  udp.seq = 0;
 			  udp.pg = 0;
 			  l4Size = 8;
 		  } else {
+			  // Reject a truncated DATA header instead of reading past the packet.
+			  if (i.GetRemainingSize() < GetUdpHeaderSize() - 8) return 0;
 			  // SeqTsHeader
 			  udp.seq = i.ReadNtohU64 ();
 			  udp.pg = i.ReadNtohU16 ();

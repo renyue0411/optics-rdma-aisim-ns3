@@ -35,9 +35,11 @@ class CustomHeader : public Header
 public:
   // Reserved private UDP control service; ordinary RDMA headers are unchanged.
   static constexpr uint16_t DCI_PATH_CONTROL_PORT = 49000;
+  // Classify the existing private wire format, not the port numbers alone.
+  static bool IsDciPathControlUdp(const uint8_t* data, uint32_t bytes);
   bool IsDciPathControl() const {
-    return l3Prot == 0x11 && udp.sport == DCI_PATH_CONTROL_PORT &&
-      udp.dport == DCI_PATH_CONTROL_PORT;
+    return m_dciPathControl && l3Prot == 0x11 &&
+      udp.sport == DCI_PATH_CONTROL_PORT && udp.dport == DCI_PATH_CONTROL_PORT;
   }
   /**
    * \brief Construct a null custom header
@@ -67,6 +69,10 @@ public:
   virtual void Serialize (Buffer::Iterator start) const;
   virtual uint32_t Deserialize (Buffer::Iterator start);
 
+private:
+  // Parser state only; this is never serialized into a business packet.
+  bool m_dciPathControl = false;
+public:
   uint32_t brief, headerType, getInt;
   enum HeaderType{
 	L2_Header = 1,

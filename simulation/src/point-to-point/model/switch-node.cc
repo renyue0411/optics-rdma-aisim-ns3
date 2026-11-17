@@ -15,6 +15,9 @@
 #include "ns3/int-header.h"
 #include "ns3/simulator.h"
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
 
 namespace ns3 {
 
@@ -53,6 +56,17 @@ SwitchNode::SwitchNode(){
 	m_timeFlowTable.SetMode(TimeFlowTable::DISABLED);
 	m_node_type = 1;
 	m_mmu = CreateObject<SwitchMmu>();
+        // DCI_ECN_STREAM_V1: optional; default preserves legacy ECN.
+        const char* ecnMode = std::getenv("SIMAI_ECN_STABLE_STREAMS");
+        NS_ABORT_MSG_IF(ecnMode && std::strcmp(ecnMode, "0") != 0 &&
+                        std::strcmp(ecnMode, "1") != 0,
+                        "SIMAI_ECN_STABLE_STREAMS must be 0 or 1");
+        if (ecnMode && std::strcmp(ecnMode, "1") == 0) {
+          const int64_t stream = 2400000000LL + int64_t(GetId());
+          m_mmu->SetEcnStream(stream);
+          std::cout << "ECN_RNG_CONFIG node=" << GetId()
+                    << " mode=per_switch stream=" << stream << std::endl;
+        }
 	for (uint32_t i = 0; i < pCnt; i++)
 		for (uint32_t j = 0; j < pCnt; j++)
 			for (uint32_t k = 0; k < qCnt; k++)
@@ -325,7 +339,11 @@ void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Pack
 				Ipv4Header h;
 				p->RemoveHeader(ppp);
 				p->RemoveHeader(h);
-				h.SetEcn((Ipv4Header::EcnType)0x03);
+				// ECT is capability; CE is congestion. Keep DSCP and existing CE.
+				// This remains an ECN marking model, not a RED early-drop policy.
+				if (h.GetEcn() == Ipv4Header::ECN_ECT0 ||
+				    h.GetEcn() == Ipv4Header::ECN_ECT1)
+					h.SetEcn(Ipv4Header::ECN_CE);
 				p->AddHeader(h);
 				p->AddHeader(ppp);
 			}
@@ -336,12 +354,10 @@ void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Pack
 	if (1){
 		uint8_t* buf = p->GetBuffer();
 		const uint32_t udpOffset = PppHeader::GetStaticSize() + 20;
-		const uint16_t controlPort = CustomHeader::DCI_PATH_CONTROL_PORT;
 		const bool dciControl = p->GetSize() >= udpOffset + 8 &&
-			buf[udpOffset] == (controlPort >> 8) &&
-			buf[udpOffset + 1] == (controlPort & 0xff) &&
-			buf[udpOffset + 2] == (controlPort >> 8) &&
-			buf[udpOffset + 3] == (controlPort & 0xff);
+			buf[PppHeader::GetStaticSize() + 9] == 0x11 &&
+			CustomHeader::IsDciPathControlUdp(buf + udpOffset,
+			                                p->GetSize() - udpOffset);
 		// Control UDP has no INT header. Preserve ordinary DATA telemetry.
 		if (buf[PppHeader::GetStaticSize() + 9] == 0x11 && !dciControl){
 			IntHeader *ih = (IntHeader*)&buf[PppHeader::GetStaticSize() + 20 + 8 + 6]; // ppp, ip, udp, SeqTs, INT

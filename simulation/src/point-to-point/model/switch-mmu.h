@@ -2,6 +2,7 @@
 #define SWITCH_MMU_H
 
 #include <unordered_map>
+#include "ns3/random-variable-stream.h"
 #include <ns3/node.h>
 #include <ns3/abort.h>
 
@@ -17,6 +18,7 @@ public:
 	static TypeId GetTypeId (void);
 
 	SwitchMmu(void);
+        void SetEcnStream(int64_t stream);
 	// DCI_WAN_POOL_V1: WAN ingress shares a finite lossy pool; LAN PFC is retained.
 	bool m_dciWanPool = false;
 	bool m_dciWanPort[pCnt] = {};
@@ -74,6 +76,9 @@ public:
 	uint32_t ingress_bytes[pCnt][qCnt];
 	uint32_t paused[pCnt][qCnt];
 	uint64_t egress_bytes[pCnt][qCnt];
+private:
+        // DCI_ECN_STREAM_V1
+        Ptr<UniformRandomVariable> m_ecnRandom;
 };
 
 } /* namespace ns3 */

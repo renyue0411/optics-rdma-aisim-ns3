@@ -179,6 +179,9 @@ public:
 	typedef Callback<void, Ptr<RdmaQueuePair>, uint64_t> AckProgressCallback;
 	TxProgressCallback m_txProgressCallback;
 	AckProgressCallback m_ackProgressCallback;
+	// Optional receiver-local contiguous-prefix observation, not a verbs CQE.
+	typedef Callback<void, Ptr<RdmaRxQueuePair>, uint64_t> RxProgressCallback;
+	RxProgressCallback m_rxProgressCallback;
 	typedef Callback<void, Ptr<RdmaQueuePair>, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t>
 		WrCompletionCallback;
 
@@ -253,6 +256,7 @@ public:
 	void SetQpProgressCallback(QpProgressCallback cb);
 	void SetQpRecoverCallback(QpRecoverCallback cb);
 	void SetFlowProgressCallbacks(TxProgressCallback txCb, AckProgressCallback ackCb);
+	void SetRxProgressCallback(RxProgressCallback cb) { m_rxProgressCallback = cb; }
 	void SetWrCompletionCallback(WrCompletionCallback cb);
 	void GenerateWrCompletions(Ptr<RdmaQueuePair> qp);
 	void GenerateWrErrorCompletions(Ptr<RdmaQueuePair> qp);

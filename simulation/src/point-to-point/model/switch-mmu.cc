@@ -11,9 +11,19 @@
 #include "ns3/simulator.h"
 #include "ns3/random-variable.h"
 #include "switch-mmu.h"
+#include "ns3/integer.h"
+#include "ns3/object-factory.h"
 
 NS_LOG_COMPONENT_DEFINE("SwitchMmu");
 namespace ns3 {
+void SwitchMmu::SetEcnStream(int64_t stream) {
+  // DCI_ECN_STREAM_V1: explicit stream, persistent for this MMU.
+  NS_ABORT_MSG_IF(stream < 0 || m_ecnRandom != nullptr,
+                  "ECN stream must be configured once, before traffic");
+  m_ecnRandom = CreateObjectWithAttributes<UniformRandomVariable>(
+      "Stream", IntegerValue(stream));
+}
+
 	TypeId SwitchMmu::GetTypeId(void){
 		static TypeId tid = TypeId("ns3::SwitchMmu")
 			.SetParent<Object>()
@@ -146,7 +156,7 @@ namespace ns3 {
 			return true;
 		if (egress_bytes[ifindex][qIndex] > kmin[ifindex]){
 			double p = pmax[ifindex] * double(egress_bytes[ifindex][qIndex] - kmin[ifindex]) / (kmax[ifindex] - kmin[ifindex]);
-			if (UniformVariable(0, 1).GetValue() < p)
+			if ((m_ecnRandom ? m_ecnRandom->GetValue() : UniformVariable(0, 1).GetValue()) < p)
 				return true;
 		}
 		return false;

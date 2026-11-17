@@ -2,6 +2,8 @@
 #ifndef DCI_PATH_MANAGER_APP_H
 #define DCI_PATH_MANAGER_APP_H
 #include "ns3/application.h"
+#include "ns3/callback.h"
+#include <tuple>
 #include "ns3/event-id.h"
 #include "ns3/header.h"
 #include "ns3/ipv4-address.h"
@@ -55,6 +57,16 @@ public:
     uint64_t samples = 0, txPackets = 0, rxPackets = 0;
     uint64_t txBytes = 0, rxBytes = 0, timeouts = 0, enqueueDrops = 0;
     uint64_t staleReplies = 0;
+    // Local port statistics, independent of probe counters.
+    bool hasLocalEgressStats = false;
+    uint64_t localSampleTimeNs = 0, linkRateBps = 0;
+    uint64_t egressQueueBytes = 0, egressTxCompletedBytes = 0;
+    // DCI_BUSINESS_SNAPSHOT_V1: historical feedback, separate from live port stats.
+    uint64_t snapshotTimeNs = 0;
+    bool hasBusinessFeedback = false;
+    uint64_t businessFeedbackSamples = 0, businessCeSamples = 0;
+    uint64_t businessLocalQueueNs = 0, businessDataFeedbackNs = 0;
+    uint64_t businessSampleTxNs = 0, businessFeedbackReceivedNs = 0;
     bool IsUsable() const { return status == UP; }
   };
   static constexpr uint32_t MAX_PATHS = 4096, MAX_PENDING_WORK = 4096;
@@ -77,6 +89,54 @@ protected:
   void StopApplication() override;
   void DoDispose() override;
 private:
+  // DCI_BUSINESS_SAMPLING_V1: local records; no fields are added to DATA.
+  struct BusinessKey {
+    uint32_t sip = 0, dip = 0, frameBytes = 0;
+    uint16_t sport = 0, dport = 0, pg = 0, ipid = 0;
+    uint64_t seq = 0;
+    bool operator<(const BusinessKey& b) const {
+      return std::tie(sip, dip, sport, dport, pg, ipid, seq, frameBytes) <
+             std::tie(b.sip, b.dip, b.sport, b.dport, b.pg, b.ipid, b.seq, b.frameBytes);
+    }
+  };
+  struct BusinessRecord {
+    uint64_t enqueuedNs = 0, txNs = 0, generation = 0;
+    bool transmitted = false, ambiguous = false, retired = false;
+    EventId deadline;
+  };
+  struct BusinessStats {
+    uint64_t candidates = 0, started = 0, completed = 0, ceSamples = 0;
+    uint64_t timeouts = 0, noTx = 0, txFailures = 0, capped = 0, ambiguous = 0;
+    uint64_t reportsTx = 0, reportsRx = 0, reportBytes = 0;
+    uint64_t reportsSuppressed = 0, reportDrops = 0, unmatched = 0;
+    uint64_t nextReportNs = 0, localQueueNs = 0, feedbackNs = 0;
+    uint64_t lastSampleNs = 0, lastFeedbackNs = 0;
+    uint32_t pending = 0, peakPending = 0;
+  };
+  static constexpr uint32_t BUSINESS_MAX_PENDING = 1024;
+  static constexpr uint32_t BUSINESS_MAX_PER_PATH = 64;
+  using BusinessTraceCallback = Callback<void, Ptr<const Packet>>;
+  using BusinessRecordKey = std::pair<uint32_t, BusinessKey>;
+  void StartBusinessSampling();
+  void StopBusinessSampling();
+  static void BusinessTrace(DciPathManagerApp* app, uint32_t path,
+                            uint8_t stage, Ptr<const Packet> packet);
+  bool GetBusinessKey(Ptr<const Packet> packet, BusinessKey& key,
+                       uint8_t& ecn) const;
+  bool IsBusinessSample(const BusinessKey& key) const;
+  void ObserveBusiness(uint32_t path, uint8_t stage, Ptr<const Packet> packet);
+  void ExpireBusiness(uint32_t path, BusinessKey key, uint64_t generation);
+  void ReportBusiness(uint64_t workId, uint32_t path, BusinessKey key, uint8_t ecn);
+  bool ReceiveBusiness(uint32_t path, Ptr<Packet> payload, uint32_t frameBytes);
+  void PrintBusinessStats() const;
+  bool m_businessEnabled = false;
+  uint32_t m_businessEvery = 1024;
+  uint64_t m_businessReportGapNs = 100000, m_businessGeneration = 0;
+  uint64_t m_businessReportSequence = 0;
+  std::map<BusinessRecordKey, BusinessRecord> m_businessRecords;
+  std::map<uint32_t, BusinessStats> m_businessStats;
+  std::map<std::pair<uint32_t, uint8_t>, BusinessTraceCallback> m_businessHooks;
+
   struct Path {
     Snapshot view;
     Ptr<QbbNetDevice> device;

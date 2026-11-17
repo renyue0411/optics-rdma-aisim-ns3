@@ -47,7 +47,24 @@ void CheckPool(){
 }
 struct Wire{
   uint64_t wan=0,lan=0;
-  void Wan(Ptr<const Packet> p){CustomHeader c(CustomHeader::L2_Header|CustomHeader::L3_Header|CustomHeader::L4_Header);p->PeekHeader(c);if(c.l3Prot==0xFE)++wan;}
+  uint32_t ecnMask=0,nvlsRx=0;
+  void Wan(Ptr<const Packet> p){
+    CustomHeader c(CustomHeader::L2_Header|CustomHeader::L3_Header|CustomHeader::L4_Header);
+    p->PeekHeader(c); if(c.l3Prot==0xFE)++wan;
+    if(c.l3Prot==0x11 && c.udp.sport>=21000 && c.udp.sport<21008){
+      const uint32_t i=c.udp.sport-21000;
+      const uint8_t expected=(i<4?0xa0:4) | (i%4==0?0:3);
+      Need(c.m_tos==expected,"switch ECN changed Not-ECT, DSCP, or failed to mark ECT");
+      Need(c.udp.seq==0 && c.udp.pg==3,"switch ECN corrupted DATA header");
+      Need(!(ecnMask & (1U<<i)),"ECN fixture transmitted duplicate DATA");
+      ecnMask |= 1U<<i;
+    }
+  }
+  int Receive(Ptr<QbbNetDevice>,Ptr<Packet>,CustomHeader& c){
+    Need(c.l3Prot==0x11 && c.udp.sport>=21004 && c.udp.sport<21008,
+         "non-NVLS packet was delivered to the local RDMA callback");
+    ++nvlsRx; return 0;
+  }
   void Lan(Ptr<const Packet> p){CustomHeader c(CustomHeader::L2_Header|CustomHeader::L3_Header|CustomHeader::L4_Header);p->PeekHeader(c);if(c.l3Prot==0xFE)++lan;}
 };
 }
@@ -81,6 +98,7 @@ int main(){
        a->m_mmu->buffer_size==160*1048576 && a->m_mmu->kmin[1]==1000000 &&
        a->m_mmu->kmax[1]==20000000,"WAN configuration not applied");
   Wire wire;
+  sink->m_rdmaReceiveCb=MakeCallback(&Wire::Receive,&wire);
   source->TraceConnectWithoutContext("PhyTxBegin",MakeCallback(&Wire::Wan,&wire));
   local->TraceConnectWithoutContext("PhyTxBegin",MakeCallback(&Wire::Lan,&wire));
   Simulator::Schedule(MicroSeconds(1),[=](){source->SendPfc(3,0);local->SendPfc(3,0);});
@@ -93,7 +111,33 @@ int main(){
     CustomHeader c(CustomHeader::L2_Header|CustomHeader::L3_Header|CustomHeader::L4_Header);p->PeekHeader(c);
     source->SwitchSend(0,p,c);
   });
+  Simulator::Schedule(MicroSeconds(400),[=](){
+    // A warm-up frame keeps the link busy while all test frames are enqueued.
+    // A trailing frame leaves a positive DATA backlog for every tested dequeue.
+    Ipv4Address destination("11.0.99.1");
+    a->AddTableEntry(destination,source->GetIfIndex());
+    a->m_mmu->ConfigEcn(source->GetIfIndex(),0,0,1);
+    for(int i=-1;i<=8;++i){
+      const bool tested=i>=0 && i<8;
+      CustomHeader c(CustomHeader::L2_Header|CustomHeader::L3_Header|CustomHeader::L4_Header);
+      c.pppProto=0x0021;c.l3Prot=0x11;
+      c.sip=Ipv4Address("11.0.2.1").Get();c.dip=destination.Get();
+      c.m_tos=tested?((i<4?0xa0:4)|(i%4)):2;
+      c.udp.sport=tested?21000+i:22000;c.udp.dport=100;c.udp.pg=3;c.udp.seq=0;
+      c.udp.payload_size=CustomHeader::GetUdpHeaderSize()+1000;
+      c.m_payloadSize=c.udp.payload_size;
+      auto p=Create<Packet>(1000);p->AddHeader(c);
+      p->AddPacketTag(FlowIdTag(local->GetIfIndex()));
+      a->SwitchReceiveFromDevice(local,p,c);
+    }
+  });
   Simulator::Stop(MilliSeconds(1));Simulator::Run();
+  Need(wire.ecnMask==255 && wire.nvlsRx==4,
+       "ECN wire cases missing or NVLS forwarding depends on ECN bits");
+  Need(a->m_mmu->m_dciDataUsed==0 && b->m_mmu->m_dciDataUsed==0,
+       "ECN fixture left DATA admission accounting outstanding");
+  std::cout<<"ECN_WIRE_CHECK_OK codepoints=0,1,2,3 dscp_preserved=1"
+             " data_frames=8 nvls_received=4 actual_qbb_tx_verified=1\n";
   Need(source->m_dciPfcTx==0 && source->m_dciPfcTxSuppressed==1 && wire.wan==1,
        "disabled WAN transmitted a generated PFC");
   Need(sink->m_dciPfcRx==1 && sink->m_dciPfcIgnored==1 && !sink->IsPfcPaused(3),

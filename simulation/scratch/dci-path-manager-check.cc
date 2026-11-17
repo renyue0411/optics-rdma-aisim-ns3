@@ -23,15 +23,64 @@ struct WireCounts {
 };
 // Regression guard: existing DATA wire fields including 64-bit sequence survive.
 void CheckDataHeader() {
-  CustomHeader a(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
-  a.pppProto = 0x0021; a.l3Prot = 0x11; a.sip = 1; a.dip = 2;
-  a.udp.sport = 10000; a.udp.dport = 20000;
-  a.udp.pg = 3; a.udp.seq = (uint64_t(1) << 40) + 17; a.udp.payload_size = 100;
-  auto p = Create<Packet>(100); p->AddHeader(a);
-  CustomHeader b(a.headerType); b.brief = 0;
-  Require(p->PeekHeader(b) == a.GetSerializedSize(), "DATA header size changed");
-  Require(!b.IsDciPathControl() && b.udp.seq == a.udp.seq && b.udp.pg == 3 &&
-    b.udp.sport == 10000 && b.udp.dport == 20000, "DATA header regression");
+  const auto savedMode = IntHeader::mode;
+  uint32_t dataCases = 0, controlCases = 0;
+  CustomHeader decoded(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                       CustomHeader::L4_Header);
+  decoded.brief = 0;
+  for (auto mode : {IntHeader::NONE, IntHeader::TS,
+                    IntHeader::NORMAL, IntHeader::PINT}) {
+    IntHeader::mode = mode;
+    for (uint16_t sport : {uint16_t(10000), uint16_t(49000)})
+    for (uint16_t dport : {uint16_t(100), uint16_t(49000)})
+    for (uint64_t seq : {uint64_t(0), (uint64_t(1) << 40) + 17}) {
+      CustomHeader a(decoded.headerType);
+      a.pppProto = 0x0021; a.l3Prot = 0x11; a.sip = 1; a.dip = 2;
+      a.udp.sport = sport; a.udp.dport = dport;
+      a.udp.pg = 3; a.udp.seq = seq;
+      a.udp.payload_size = CustomHeader::GetUdpHeaderSize() + 100;
+      a.m_payloadSize = a.udp.payload_size;
+      auto p = Create<Packet>(100); p->AddHeader(a);
+      Require(p->PeekHeader(decoded) == a.GetSerializedSize(), "DATA header size changed");
+      Require(!decoded.IsDciPathControl() && decoded.udp.seq == seq &&
+        decoded.udp.pg == 3 && decoded.udp.sport == sport &&
+        decoded.udp.dport == dport, "DATA port collision or header regression");
+      ++dataCases;
+    }
+    for (bool business : {false, true}) {
+      std::vector<uint8_t> payload(business ? 56 : 40, 0);
+      payload[0] = 0x44; payload[1] = 0x43;
+      payload[2] = business ? 0x42 : 0x50;
+      payload[3] = business ? 0x46 : 0x4d;
+      payload[4] = 1; payload[5] = business ? 0 : 1;
+      payload[business ? 47 : 23] = 1;
+      payload[business ? 55 : 31] = 1;
+      auto p = Create<Packet>(payload.data(), payload.size());
+      UdpHeader udp; udp.SetSourcePort(49000); udp.SetDestinationPort(49000);
+      p->AddHeader(udp);
+      Ipv4Header ip; ip.SetSource(Ipv4Address("10.255.0.1"));
+      ip.SetDestination(Ipv4Address("10.255.0.2"));
+      ip.SetProtocol(17); ip.SetPayloadSize(p->GetSize()); p->AddHeader(ip);
+      PppHeader ppp; ppp.SetProtocol(0x0021); p->AddHeader(ppp);
+      Require(p->PeekHeader(decoded) == 42 && decoded.IsDciPathControl(),
+        "private UDP format was not recognized");
+      ++controlCases;
+      // Reuse this object for DATA: Deserialize must clear its control flag.
+      CustomHeader data(decoded.headerType);
+      data.pppProto = 0x0021; data.l3Prot = 0x11; data.sip = 1; data.dip = 2;
+      data.udp.sport = 49000; data.udp.dport = 49000;
+      data.udp.pg = 3; data.udp.seq = 17;
+      data.udp.payload_size = CustomHeader::GetUdpHeaderSize() + 100;
+      data.m_payloadSize = data.udp.payload_size;
+      auto ordinary = Create<Packet>(100); ordinary->AddHeader(data);
+      Require(ordinary->PeekHeader(decoded) == data.GetSerializedSize() &&
+        !decoded.IsDciPathControl() && decoded.udp.seq == 17 && decoded.udp.pg == 3,
+        "stale control classification leaked into DATA");
+    }
+  }
+  IntHeader::mode = savedMode;
+  std::cout << "HEADER_CLASSIFICATION_CHECK_OK data_cases=" << dataCases
+            << " control_cases=" << controlCases << std::endl;
 }
 }
 int RunCheck(int argc, char** argv) {

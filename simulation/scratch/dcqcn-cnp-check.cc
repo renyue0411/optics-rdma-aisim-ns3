@@ -13,6 +13,15 @@ using namespace ns3;
 namespace {
 void Need(bool ok, const char* why) { NS_ABORT_MSG_IF(!ok, why); }
 void Noop(Ptr<RdmaQueuePair>) {}
+struct ReceiveProgress {
+  uint64_t calls = 0;
+  std::map<uint16_t,uint64_t> prefixes;
+  void Observe(Ptr<RdmaRxQueuePair> q, uint64_t prefix) {
+    Need(prefix == q->ReceiverNextExpectedSeq && prefix > prefixes[q->dport],
+         "RX progress is not a strictly advancing local contiguous prefix");
+    prefixes[q->dport] = prefix; ++calls;
+  }
+};
 struct ReturnWire {
   Ptr<RdmaHw> sender;
   uint64_t cnps = 0, acks = 0, flags = 0, bytes = 0, enqueued = 0;
@@ -94,11 +103,29 @@ int main(int argc, char** argv) {
     hw.push_back(h);
   }
   const Ipv4Address source("10.0.0.1"), sink("10.0.1.1");
+  // Exercise actual RNIC DATA construction, without registering/sending these QPs.
+  const uint32_t savedCcMode = hw[0]->m_cc_mode;
+  for (uint32_t cc : {0U, 1U}) for (uint32_t nvls : {0U, 1U}) {
+    hw[0]->m_cc_mode = cc;
+    auto q = CreateObject<RdmaQueuePair>(3, source, sink, 20000, 100);
+    q->SetSize(2000); q->SetPostedLimit(2000); q->nvls_enable = nvls;
+    auto packet = hw[0]->GetNxtPacket(q);
+    CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
+    Need(packet->PeekHeader(ch) != 0, "cannot parse RNIC-generated DATA");
+    Need(ch.GetIpv4EcnBits() == (cc == 1 ? 2 : 0), "wrong source ECN capability");
+    Need((ch.m_tos & 0xfc) == (nvls ? 4 : 0), "source ECN changed NVLS DSCP");
+    Need(ch.udp.seq == 0 && ch.udp.pg == 3 && ch.udp.sport == 20000,
+         "source ECN changed RDMA DATA fields");
+  }
+  hw[0]->m_cc_mode = savedCcMode;
+  std::cout << "SOURCE_ECN_CHECK_OK cc_modes=0,1 nvls=0,1 data_packets=4\n";
   auto senderDev = DynamicCast<QbbNetDevice>(devs.Get(0));
   auto rxDev = DynamicCast<QbbNetDevice>(devs.Get(1));
   hw[1]->m_rtTable[source.Get()].push_back(rxDev->GetIfIndex());
   hw[0]->m_rtTable[sink.Get()].push_back(senderDev->GetIfIndex());
   ReturnWire wire; wire.sender = hw[0];
+  ReceiveProgress receiveProgress;
+  hw[1]->SetRxProgressCallback(MakeCallback(&ReceiveProgress::Observe, &receiveProgress));
   senderDev->m_rdmaReceiveCb = MakeCallback(&ReturnWire::Rx, &wire);
   Need(rxDev->TraceConnectWithoutContext("PhyTxBegin", MakeCallback(&ReturnWire::Tx, &wire)),
        "missing actual wire TX trace");
@@ -147,6 +174,11 @@ int main(int argc, char** argv) {
   }
   Simulator::Stop(MicroSeconds(100 + intervalUs * 3 + delayUs));
   Simulator::Run();
+  Need(receiveProgress.calls > 0, "receiver-local progress hook never fired");
+  if (scenario == "ooo") Need(receiveProgress.calls == 1,
+                              "out-of-order arrival incorrectly advanced RX prefix");
+  std::cout << "RX_PROGRESS_CHECK_OK callbacks=" << receiveProgress.calls
+            << " contiguous_only=1 local_receiver_state=1\n";
   const bool silent = scenario == "ect" || scenario == "ooo";
   const uint64_t expected = !mode || silent ? 0 : scenario == "two_qps" ? 4 :
     (scenario == "cancel" || scenario == "late") ? 1 : 3;
@@ -154,6 +186,7 @@ int main(int argc, char** argv) {
        wire.txTimes.size() == expected && wire.enqueued == expected &&
        wire.bytes == expected * 64, "CNP enqueue/actual wire/receive counts differ");
   Need(!mode || wire.flags == 0, "independent mode duplicated feedback on ACK/NACK");
+  if (silent) Need(wire.flags == 0, "ECT or unmarked DATA set an ACK congestion flag");
   Need(wire.acks > 0, "reliability ACK/SACK traffic disappeared");
   if (mode && scenario != "late") Need(hw[0]->m_cnpRx == expected, "CNP did not enter RP");
   if (mode && scenario == "late") Need(hw[0]->m_cnpUnknownRx == 1, "late CNP not safely ignored");
